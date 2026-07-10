@@ -1,0 +1,21 @@
+# api
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+python-multipart==0.0.20
+pydantic==2.10.4
+
+# postgres + vectors
+psycopg[binary]==3.2.3
+psycopg-pool==3.2.4
+pgvector==0.3.6
+
+# pdf extraction ladder (tried in this order)
+pymupdf4llm==0.0.17
+pymupdf==1.25.1
+pdfplumber==0.11.4
+
+# llm providers. requests covers ollama + gemini; the rest are optional
+# fallbacks and are imported lazily inside their _try_* functions.
+requests==2.32.3
+openai==1.59.3
+groq==0.13.1

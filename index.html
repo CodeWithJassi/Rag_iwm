@@ -1,0 +1,624 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Report Desk — IWM Research</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+/* ============================================================
+   Palette: cool slate. The three signal colours are reserved,
+   always and only, for broker ratings. The interactive accent is
+   violet precisely because no analyst reads violet as a rating.
+   ============================================================ */
+:root{
+  --ink:#10141A; --panel:#171C24; --raise:#1F2732; --line:#2A323E;
+  --text:#E6EAF0; --muted:#8892A4; --faint:#5B6577;
+  --buy:#3FB68B; --hold:#C9A227; --sell:#E0655F;
+  --accent:#8A7FE0; --accent-dim:#8A7FE022;
+  --sans:'Instrument Sans',system-ui,sans-serif;
+  --mono:'IBM Plex Mono',ui-monospace,monospace;
+  --rail:296px;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%}
+body{
+  font-family:var(--sans); background:var(--ink); color:var(--text);
+  font-size:15px; line-height:1.5; -webkit-font-smoothing:antialiased;
+  display:grid; grid-template-rows:auto 1fr; height:100vh; overflow:hidden;
+}
+:focus-visible{outline:2px solid var(--accent); outline-offset:2px; border-radius:3px}
+button{font:inherit;color:inherit;background:none;border:none;cursor:pointer}
+input,textarea{font:inherit;color:inherit;background:none;border:none}
+::-webkit-scrollbar{width:9px;height:9px}
+::-webkit-scrollbar-thumb{background:var(--line);border-radius:9px}
+::-webkit-scrollbar-track{background:transparent}
+
+/* ---------------------------------------------------------- top bar */
+header{
+  display:flex;align-items:center;gap:14px;
+  padding:0 20px;height:52px;border-bottom:1px solid var(--line);background:var(--panel);
+}
+.mark{
+  font-family:var(--mono);font-size:11px;font-weight:500;letter-spacing:.14em;
+  color:var(--ink);background:var(--text);padding:4px 7px;border-radius:3px;
+}
+.wordmark{font-weight:600;letter-spacing:-.01em}
+.wordmark span{color:var(--faint);font-weight:400}
+.spacer{flex:1}
+.deep{
+  display:flex;align-items:center;gap:9px;font-size:13px;color:var(--muted);
+  padding:6px 11px;border:1px solid var(--line);border-radius:20px;
+}
+.deep[data-on="1"]{border-color:var(--accent);color:var(--text);background:var(--accent-dim)}
+.switch{width:30px;height:17px;border-radius:9px;background:var(--line);position:relative;transition:background .15s}
+.switch::after{content:"";position:absolute;top:2px;left:2px;width:13px;height:13px;border-radius:50%;background:var(--faint);transition:transform .15s,background .15s}
+.deep[data-on="1"] .switch{background:var(--accent)}
+.deep[data-on="1"] .switch::after{transform:translateX(13px);background:#fff}
+
+/* ---------------------------------------------------------- shell */
+main{display:grid;grid-template-columns:var(--rail) 1fr;overflow:hidden}
+aside{
+  border-right:1px solid var(--line);background:var(--panel);
+  display:grid;grid-template-rows:auto minmax(0,1fr) auto minmax(0,auto);overflow:hidden;
+}
+.rail-head{
+  display:flex;align-items:center;justify-content:space-between;
+  padding:16px 16px 10px;
+}
+.rail-title{
+  font-family:var(--mono);font-size:10px;letter-spacing:.16em;color:var(--faint);
+}
+.icon-btn{
+  width:24px;height:24px;border-radius:4px;color:var(--muted);
+  display:grid;place-items:center;font-size:17px;line-height:1;
+}
+.icon-btn:hover{background:var(--raise);color:var(--text)}
+.rail-list{overflow-y:auto;padding:0 10px 12px}
+
+/* ---------------------------------------------------------- report card */
+.card{
+  position:relative;width:100%;text-align:left;
+  padding:11px 12px 11px 15px;border-radius:6px;margin-bottom:4px;
+  border:1px solid transparent;transition:background .12s;
+}
+.card::before{
+  content:"";position:absolute;left:0;top:9px;bottom:9px;width:3px;border-radius:3px;
+  background:var(--faint);
+}
+.card[data-rec="Buy"]::before{background:var(--buy)}
+.card[data-rec="Hold"]::before{background:var(--hold)}
+.card[data-rec="Sell"]::before{background:var(--sell)}
+.card:hover{background:var(--raise)}
+.card[aria-current="true"]{background:var(--raise);border-color:var(--line)}
+.card-co{font-weight:500;letter-spacing:-.01em;margin-bottom:2px}
+.card-meta{
+  font-family:var(--mono);font-size:11px;color:var(--faint);
+  display:flex;gap:7px;align-items:center;
+}
+.card-move{margin-left:auto;font-weight:500}
+.up{color:var(--buy)} .down{color:var(--sell)} .flat{color:var(--hold)}
+
+.chip{
+  font-family:var(--mono);font-size:10px;letter-spacing:.06em;
+  padding:1px 5px;border-radius:3px;border:1px solid var(--line);color:var(--muted);
+}
+.chip.working{color:var(--accent);border-color:var(--accent)}
+.chip.failed{color:var(--sell);border-color:var(--sell)}
+
+/* ---------------------------------------------------------- sessions */
+.rail-split{border-top:1px solid var(--line)}
+.sess-list{overflow-y:auto;padding:0 10px 12px;max-height:26vh}
+.sess{
+  width:100%;text-align:left;padding:7px 9px;border-radius:5px;
+  display:flex;align-items:center;gap:8px;color:var(--muted);font-size:13px;
+}
+.sess:hover{background:var(--raise);color:var(--text)}
+.sess[aria-current="true"]{background:var(--raise);color:var(--text)}
+.sess-t{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1}
+.sess-n{font-family:var(--mono);font-size:10px;color:var(--faint)}
+.sess-x{opacity:1;font-size:15px;color:var(--faint);padding:0 2px}
+.sess-x:hover{color:var(--sell)}
+
+/* ---------------------------------------------------------- stage */
+.stage{display:flex;flex-direction:column;overflow:hidden;background:var(--ink)}
+
+.doc-head{padding:22px 32px 0;border-bottom:1px solid var(--line)}
+.doc-top{display:flex;align-items:flex-start;gap:20px;flex-wrap:wrap}
+.doc-co{font-size:23px;font-weight:600;letter-spacing:-.02em;line-height:1.2}
+.doc-sub{
+  font-family:var(--mono);font-size:12px;color:var(--muted);margin-top:5px;
+  display:flex;gap:10px;flex-wrap:wrap;align-items:center;
+}
+.rec{
+  font-family:var(--mono);font-size:11px;font-weight:500;letter-spacing:.1em;
+  padding:3px 8px;border-radius:3px;
+}
+.rec[data-rec="Buy"]{color:var(--buy);background:#3FB68B1a}
+.rec[data-rec="Hold"]{color:var(--hold);background:#C9A2271a}
+.rec[data-rec="Sell"]{color:var(--sell);background:#E0655F1a}
+
+/* -------- SIGNATURE: the upside gauge. CMP -> target, drawn to scale. ------ */
+.gauge{min-width:250px;margin-left:auto;padding-top:2px}
+.gauge-pct{
+  font-family:var(--mono);font-size:19px;font-weight:500;text-align:right;
+  letter-spacing:-.02em;line-height:1;
+}
+.gauge-track{
+  height:3px;background:var(--line);border-radius:2px;margin:9px 0 6px;position:relative;
+}
+.gauge-fill{
+  position:absolute;left:0;top:0;bottom:0;border-radius:2px;background:currentColor;
+  transition:width .5s cubic-bezier(.2,.7,.3,1);
+}
+.gauge-dot{
+  position:absolute;top:50%;width:7px;height:7px;border-radius:50%;
+  background:currentColor;transform:translate(-50%,-50%);
+  transition:left .5s cubic-bezier(.2,.7,.3,1);
+  box-shadow:0 0 0 3px var(--ink);
+}
+.gauge-ends{
+  display:flex;justify-content:space-between;
+  font-family:var(--mono);font-size:11px;color:var(--faint);
+}
+
+.tabs{display:flex;gap:2px;margin-top:18px}
+.tab{
+  padding:8px 13px;font-size:13px;color:var(--muted);
+  border-bottom:2px solid transparent;margin-bottom:-1px;
+}
+.tab:hover{color:var(--text)}
+.tab[aria-selected="true"]{color:var(--text);border-bottom-color:var(--accent)}
+
+.pane{flex:1;overflow-y:auto;padding:26px 32px}
+.pane.hidden{display:none}
+
+/* summary pane */
+.summary{max-width:74ch;white-space:pre-wrap;color:#D2D8E1;line-height:1.65}
+.summary strong{color:var(--text);font-weight:600}
+
+/* ---------------------------------------------------------- chat */
+.thread{max-width:78ch;display:flex;flex-direction:column;gap:22px}
+.msg-user{
+  align-self:flex-end;max-width:82%;background:var(--raise);
+  border:1px solid var(--line);border-radius:12px 12px 3px 12px;padding:9px 14px;
+}
+.msg-bot{max-width:100%}
+.bot-body{line-height:1.68;color:#D8DDE5}
+.bot-body b{color:var(--text);font-weight:600}
+.bot-body ul{margin:8px 0 8px 18px}
+.bot-body li{margin:3px 0}
+.abstain{color:var(--muted);font-style:italic}
+
+.cite{
+  font-family:var(--mono);font-size:11px;vertical-align:super;line-height:0;
+  color:var(--accent);padding:0 1px;border-radius:2px;
+}
+.cite:hover{background:var(--accent-dim)}
+
+.bot-foot{display:flex;gap:8px;align-items:center;margin-top:11px;flex-wrap:wrap}
+.pill{
+  font-family:var(--mono);font-size:10px;letter-spacing:.05em;color:var(--faint);
+  border:1px solid var(--line);border-radius:12px;padding:3px 9px;
+}
+.pill:hover{color:var(--text);border-color:var(--muted)}
+.pill[aria-expanded="true"]{color:var(--accent);border-color:var(--accent)}
+
+.drawer{
+  margin-top:11px;border-left:2px solid var(--line);padding-left:13px;
+  display:flex;flex-direction:column;gap:11px;
+}
+.src{font-size:13px}
+.src-head{
+  font-family:var(--mono);font-size:10px;color:var(--faint);
+  display:flex;gap:9px;margin-bottom:3px;
+}
+.src-num{color:var(--accent)}
+.src-body{color:var(--muted);line-height:1.5}
+
+.plan{font-size:13px;color:var(--muted)}
+.plan li{margin:3px 0 3px 16px}
+
+.scores{display:flex;gap:18px;margin-top:11px}
+.score-k{font-family:var(--mono);font-size:10px;color:var(--faint);letter-spacing:.08em}
+.score-v{font-family:var(--mono);font-size:13px;margin-top:2px}
+.meter{width:70px;height:2px;background:var(--line);margin-top:5px;border-radius:2px}
+.meter i{display:block;height:100%;border-radius:2px;background:var(--buy)}
+.meter.bad i{background:var(--sell)}
+
+/* composer */
+.composer{border-top:1px solid var(--line);padding:14px 32px 20px;background:var(--ink)}
+.box{
+  max-width:78ch;display:flex;align-items:flex-end;gap:10px;
+  border:1px solid var(--line);border-radius:10px;padding:9px 9px 9px 14px;
+  background:var(--panel);transition:border-color .12s;
+}
+.box:focus-within{border-color:var(--accent)}
+.box textarea{flex:1;resize:none;max-height:150px;line-height:1.5;padding:3px 0}
+.box textarea::placeholder{color:var(--faint)}
+.send{
+  width:31px;height:31px;border-radius:7px;background:var(--accent);color:#fff;
+  display:grid;place-items:center;font-size:15px;flex-shrink:0;
+}
+.send:disabled{background:var(--line);color:var(--faint);cursor:not-allowed}
+.hint{
+  max-width:78ch;font-family:var(--mono);font-size:10px;color:var(--faint);
+  margin-top:8px;letter-spacing:.05em;
+}
+
+/* empty + status */
+.empty{
+  height:100%;display:grid;place-content:center;text-align:center;gap:8px;
+  color:var(--faint);padding:40px;
+}
+.empty h2{font-size:16px;font-weight:500;color:var(--muted);letter-spacing:-.01em}
+.empty p{font-size:13px;max-width:34ch}
+
+.dots{display:inline-flex;gap:4px;align-items:center}
+.dots i{width:4px;height:4px;border-radius:50%;background:var(--muted);animation:blink 1.2s infinite}
+.dots i:nth-child(2){animation-delay:.2s} .dots i:nth-child(3){animation-delay:.4s}
+@keyframes blink{0%,60%,100%{opacity:.25}30%{opacity:1}}
+
+.err{color:var(--sell);font-size:13px}
+
+@media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+@media (max-width:820px){
+  main{grid-template-columns:1fr}
+  aside{display:none}
+  .pane,.composer,.doc-head{padding-left:18px;padding-right:18px}
+}
+</style>
+</head>
+<body>
+
+<header>
+  <div class="mark">IWM</div>
+  <div class="wordmark">Report Desk <span>· equity research</span></div>
+  <div class="spacer"></div>
+  <button class="deep" id="deep" data-on="0" aria-pressed="false">
+    <span class="switch"></span> Deep search
+  </button>
+</header>
+
+<main>
+  <aside>
+    <div class="rail-head">
+      <div class="rail-title">REPORTS</div>
+      <button class="icon-btn" id="add" title="Upload a report" aria-label="Upload a report">+</button>
+    </div>
+    <div class="rail-list" id="reports"></div>
+
+    <div class="rail-head rail-split">
+      <div class="rail-title">CHATS</div>
+      <button class="icon-btn" id="newchat" title="Start a chat" aria-label="Start a chat">+</button>
+    </div>
+    <div class="sess-list" id="sessions"></div>
+  </aside>
+
+  <section class="stage" id="stage"></section>
+</main>
+
+<input type="file" id="picker" accept="application/pdf" hidden>
+
+<script>
+// ============================================================
+// State. One report selected, one session inside it. Nothing else.
+// ============================================================
+const S = { reports: [], report: null, sessions: [], session: null, turns: [], deep: false, busy: false };
+const api = async (path, opts = {}) => {
+  const r = await fetch('/api' + path, opts);
+  if (r.status === 204) return null;
+  if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || r.statusText);
+  return r.json();
+};
+const esc = s => (s ?? '').replace(/[&<>"]/g, c => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;' }[c]));
+const money = n => n == null ? '—' : Number(n).toLocaleString('en-IN', { maximumFractionDigits: 0 });
+const upside = r => (r.current_price && r.target_price) ? (r.target_price - r.current_price) / r.current_price * 100 : null;
+const dirClass = p => p == null ? 'flat' : p > 1 ? 'up' : p < -1 ? 'down' : 'flat';
+const dirVar = p => p == null ? 'var(--hold)' : p > 1 ? 'var(--buy)' : p < -1 ? 'var(--sell)' : 'var(--hold)';
+
+// ============================================================
+// Reports rail
+// ============================================================
+async function loadReports() {
+  S.reports = await api('/reports');
+  const el = document.getElementById('reports');
+  if (!S.reports.length) {
+    el.innerHTML = `<div style="padding:20px 6px;font-size:13px;color:var(--faint)">
+      No reports yet. Upload a broker PDF to start.</div>`;
+    return renderStage();
+  }
+  el.innerHTML = S.reports.map(r => {
+    const p = upside(r);
+    const ready = r.status === 'ready';
+    const tail = ready
+      ? (p == null ? '' : `<span class="card-move ${dirClass(p)}">${p > 0 ? '▲' : p < 0 ? '▼' : '■'} ${p.toFixed(1)}%</span>`)
+      : `<span class="chip ${r.status === 'failed' ? 'failed' : 'working'}">${r.status.toUpperCase()}</span>`;
+    return `<button class="card" data-id="${r.id}" data-rec="${r.recommendation || ''}"
+              aria-current="${S.report?.id === r.id}">
+        <div class="card-co">${esc(r.company)}</div>
+        <div class="card-meta"><span>${esc(r.broker || r.file_name)}</span>${tail}</div>
+      </button>`;
+  }).join('');
+  el.querySelectorAll('.card').forEach(b =>
+    b.onclick = () => selectReport(+b.dataset.id));
+
+  // Anything still ingesting? Poll until it settles.
+  if (S.reports.some(r => r.status === 'pending' || r.status === 'processing'))
+    setTimeout(loadReports, 3000);
+}
+
+async function selectReport(id) {
+  S.report = await api(`/reports/${id}`);
+  S.session = null; S.turns = [];
+  await loadReports();
+  await loadSessions();
+  if (S.report.status === 'ready' && S.sessions.length) selectSession(S.sessions[0].id);
+  else renderStage();
+}
+
+// ============================================================
+// Sessions — memory lives per (report, session)
+// ============================================================
+async function loadSessions() {
+  const el = document.getElementById('sessions');
+  if (!S.report) { S.sessions = []; el.innerHTML = ''; return; }
+  S.sessions = await api(`/reports/${S.report.id}/sessions`);
+  el.innerHTML = S.sessions.length ? S.sessions.map(s => `
+    <button class="sess" data-id="${s.id}" aria-current="${S.session === s.id}">
+      <span class="sess-t">${esc(s.title)}</span>
+      <span class="sess-n">${s.n_turns}</span>
+      <span class="sess-x" data-del="${s.id}" role="button" aria-label="Delete chat">×</span>
+    </button>`).join('')
+    : `<div style="padding:6px 9px;font-size:13px;color:var(--faint)">No chats yet.</div>`;
+
+  el.querySelectorAll('.sess').forEach(b => b.onclick = e => {
+    if (e.target.dataset.del) return dropSession(+e.target.dataset.del);
+    selectSession(+b.dataset.id);
+  });
+}
+
+async function newSession() {
+  if (!S.report || S.report.status !== 'ready') return;
+  const { id } = await api(`/reports/${S.report.id}/sessions`, { method: 'POST' });
+  await loadSessions(); selectSession(id);
+}
+async function dropSession(id) {
+  await api(`/sessions/${id}`, { method: 'DELETE' });
+  if (S.session === id) { S.session = null; S.turns = []; }
+  await loadSessions(); renderStage();
+}
+async function selectSession(id) {
+  S.session = id;
+  S.turns = await api(`/sessions/${id}/turns`);
+  await loadSessions();
+  renderStage('chat');
+  scrollThread();
+}
+
+// ============================================================
+// Stage
+// ============================================================
+let tab = 'summary';
+
+function gauge(r) {
+  const p = upside(r);
+  if (p == null) return '';
+  // Bar length is proportional to the move, capped at ±40% so an outlier
+  // target does not flatten every other report's gauge into invisibility.
+  const w = Math.min(Math.abs(p), 40) / 40 * 100;
+  return `<div class="gauge" style="color:${dirVar(p)}">
+    <div class="gauge-pct">${p > 0 ? '+' : ''}${p.toFixed(1)}%</div>
+    <div class="gauge-track">
+      <div class="gauge-fill" style="width:${w}%"></div>
+      <div class="gauge-dot" style="left:${w}%"></div>
+    </div>
+    <div class="gauge-ends"><span>CMP ${money(r.current_price)}</span><span>TGT ${money(r.target_price)}</span></div>
+  </div>`;
+}
+
+function renderStage(force) {
+  const st = document.getElementById('stage');
+  if (force) tab = force;
+
+  if (!S.report) {
+    st.innerHTML = `<div class="empty"><h2>Select a report</h2>
+      <p>Pick a broker report on the left, or upload one to summarise and index it.</p></div>`;
+    return;
+  }
+  if (S.report.status === 'failed') {
+    st.innerHTML = `<div class="empty"><h2>Ingestion failed</h2>
+      <p class="err">${esc((S.report.error || '').split('\n').pop())}</p>
+      <p>Re-upload the PDF, or check that Ollama is reachable.</p></div>`;
+    return;
+  }
+  if (S.report.status !== 'ready') {
+    st.innerHTML = `<div class="empty"><h2>Indexing ${esc(S.report.company)}</h2>
+      <p>Summarising, chunking and embedding. This takes a minute on CPU.</p>
+      <span class="dots"><i></i><i></i><i></i></span></div>`;
+    setTimeout(() => selectReport(S.report.id), 3000);
+    return;
+  }
+
+  const r = S.report;
+  st.innerHTML = `
+    <div class="doc-head">
+      <div class="doc-top">
+        <div>
+          <div class="doc-co">${esc(r.company)}</div>
+          <div class="doc-sub">
+            ${r.recommendation ? `<span class="rec" data-rec="${r.recommendation}">${r.recommendation.toUpperCase()}</span>` : ''}
+            <span>${esc(r.broker || 'Unknown broker')}</span>
+            <span>·</span><span>${new Date(r.uploaded_at).toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: '2-digit' })}</span>
+            <span>·</span><span>${r.n_chunks} chunks</span>
+          </div>
+        </div>
+        ${gauge(r)}
+      </div>
+      <div class="tabs" role="tablist">
+        <button class="tab" role="tab" data-t="summary" aria-selected="${tab === 'summary'}">Summary</button>
+        <button class="tab" role="tab" data-t="chat" aria-selected="${tab === 'chat'}">Chat</button>
+      </div>
+    </div>
+
+    <div class="pane ${tab === 'summary' ? '' : 'hidden'}" id="pane-summary">
+      <div class="summary">${fmt(r.summary || 'No summary was generated.')}</div>
+    </div>
+
+    <div class="pane ${tab === 'chat' ? '' : 'hidden'}" id="pane-chat">
+      <div class="thread" id="thread"></div>
+    </div>
+
+    ${tab === 'chat' ? `
+    <div class="composer">
+      <div class="box">
+        <textarea id="q" rows="1" placeholder="Ask about ${esc(r.company)} — figures, thesis, risks, assumptions"></textarea>
+        <button class="send" id="send" aria-label="Send">↑</button>
+      </div>
+      <div class="hint">ANSWERS ARE GROUNDED IN THIS REPORT ONLY · ENTER TO SEND</div>
+    </div>` : ''}`;
+
+  st.querySelectorAll('.tab').forEach(t => t.onclick = () => renderStage(t.dataset.t));
+  if (tab === 'chat') {
+    renderThread();
+    const q = document.getElementById('q');
+    q.oninput = () => { q.style.height = 'auto'; q.style.height = Math.min(q.scrollHeight, 150) + 'px'; };
+    q.onkeydown = e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); } };
+    document.getElementById('send').onclick = send;
+    q.focus();
+  }
+}
+
+// Light markdown. A dependency for **bold** and bullets would be silly.
+function fmt(t) {
+  return esc(t)
+    .replace(/\*\*(.+?)\*\*/g, '<b>$1</b>')
+    .replace(/^[-*•]\s+(.*)$/gm, '<li>$1</li>')
+    .replace(/(<li>[\s\S]*?<\/li>)(?!\s*<li>)/g, '<ul>$1</ul>')
+    .replace(/\n{2,}/g, '<br><br>');
+}
+// [3] -> a clickable superscript that opens the source drawer.
+const citeify = t => t.replace(/\[(\d+)\]/g, '<button class="cite" data-n="$1">[$1]</button>');
+
+function renderThread() {
+  const el = document.getElementById('thread');
+  if (!el) return;
+  if (!S.session) {
+    el.innerHTML = `<div class="empty"><h2>No chat open</h2>
+      <p>Start a chat to ask questions about this report.</p></div>`;
+    return;
+  }
+  el.innerHTML = S.turns.map(t => t.role === 'user'
+    ? `<div class="msg-user">${esc(t.content)}</div>`
+    : botHTML(t)).join('') + (S.busy ? `
+      <div class="msg-bot"><span class="dots"><i></i><i></i><i></i></span></div>` : '');
+  wireCites(el);
+}
+
+function botHTML(t) {
+  const cites = t.citations || [], subs = t.sub_questions || [], sc = t.scores;
+  const body = t.abstained
+    ? `<div class="bot-body abstain">${esc(t.content)}</div>`
+    : `<div class="bot-body">${citeify(fmt(t.content))}</div>`;
+
+  const foot = [];
+  if (cites.length) foot.push(`<button class="pill" data-drawer="src-${t.id}" aria-expanded="false">${cites.length} SOURCES</button>`);
+  if (subs.length > 1) foot.push(`<button class="pill" data-drawer="plan-${t.id}" aria-expanded="false">SEARCH PLAN · ${subs.length}</button>`);
+
+  const meter = (k, v) => `<div><div class="score-k">${k}</div>
+    <div class="score-v">${(v * 100).toFixed(0)}%</div>
+    <div class="meter ${v < .7 ? 'bad' : ''}"><i style="width:${v * 100}%"></i></div></div>`;
+
+  return `<div class="msg-bot">${body}
+    ${foot.length ? `<div class="bot-foot">${foot.join('')}</div>` : ''}
+    ${cites.length ? `<div class="drawer" id="src-${t.id}" hidden>${cites.map(c => `
+      <div class="src">
+        <div class="src-head"><span class="src-num">[${c.n}]</span>
+          <span>PAGE ${c.page_no}</span>${c.section ? `<span>${esc(c.section)}</span>` : ''}
+          <span>SIM ${c.similarity}</span></div>
+        <div class="src-body">${esc(c.snippet)}…</div>
+      </div>`).join('')}</div>` : ''}
+    ${subs.length > 1 ? `<div class="drawer plan" id="plan-${t.id}" hidden>
+      <ul>${subs.map(s => `<li>${esc(s)}</li>`).join('')}</ul></div>` : ''}
+    ${sc ? `<div class="scores">${meter('FAITHFULNESS', sc.faithfulness)}${meter('RELEVANCY', sc.relevancy)}</div>` : ''}
+  </div>`;
+}
+
+function wireCites(root) {
+  root.querySelectorAll('[data-drawer]').forEach(b => b.onclick = () => {
+    const d = document.getElementById(b.dataset.drawer);
+    d.hidden = !d.hidden;
+    b.setAttribute('aria-expanded', String(!d.hidden));
+  });
+  // Clicking [3] in the prose opens that answer's source drawer.
+  root.querySelectorAll('.cite').forEach(c => c.onclick = () => {
+    const btn = c.closest('.msg-bot').querySelector('[data-drawer^="src-"]');
+    if (btn && document.getElementById(btn.dataset.drawer).hidden) btn.click();
+  });
+}
+
+const scrollThread = () => {
+  const p = document.getElementById('pane-chat');
+  if (p) p.scrollTop = p.scrollHeight;
+};
+
+// ============================================================
+// Send
+// ============================================================
+async function send() {
+  const q = document.getElementById('q');
+  const text = q.value.trim();
+  if (!text || S.busy) return;
+
+  if (!S.session) { await newSession(); return send(); }
+
+  q.value = ''; q.style.height = 'auto';
+  S.turns.push({ role: 'user', content: text });
+  S.busy = true; renderThread(); scrollThread();
+
+  try {
+    const res = await api(`/sessions/${S.session}/chat`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ query: text, deep_search: S.deep }),
+    });
+    S.turns.push({
+      id: Date.now(), role: 'assistant', content: res.answer, abstained: res.abstained,
+      citations: res.citations, sub_questions: res.sub_questions, scores: res.scores,
+    });
+  } catch (e) {
+    S.turns.push({ id: Date.now(), role: 'assistant', content: `Request failed: ${e.message}`, abstained: true });
+  } finally {
+    S.busy = false; renderThread(); scrollThread(); loadSessions();
+  }
+}
+
+// ============================================================
+// Upload
+// ============================================================
+document.getElementById('add').onclick = () => document.getElementById('picker').click();
+document.getElementById('picker').onchange = async e => {
+  const file = e.target.files[0];
+  if (!file) return;
+  const company = prompt('Company name for this report:', file.name.replace(/\.pdf$/i, ''));
+  if (!company) return;
+  const fd = new FormData();
+  fd.append('company', company); fd.append('file', file);
+  const { id } = await api('/reports', { method: 'POST', body: fd });
+  e.target.value = '';
+  await loadReports(); selectReport(id);
+};
+
+document.getElementById('newchat').onclick = newSession;
+document.getElementById('deep').onclick = e => {
+  S.deep = !S.deep;
+  const b = e.currentTarget;
+  b.dataset.on = S.deep ? '1' : '0';
+  b.setAttribute('aria-pressed', String(S.deep));
+};
+
+loadReports().then(renderStage);
+</script>
+</body>
+</html>

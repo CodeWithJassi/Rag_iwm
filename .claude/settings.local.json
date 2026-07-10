@@ -1,0 +1,41 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(docker --version)",
+      "Bash(docker compose *)",
+      "Bash(docker-compose --version)",
+      "Bash(ollama --version)",
+      "Bash(ollama list *)",
+      "Bash(pg_isready)",
+      "Bash(sudo -n echo ok)",
+      "Bash(pip install *)",
+      "Bash(curl -fsSL https://ollama.com/install.sh)",
+      "Read(//usr/local/bin/**)",
+      "Read(//home/jass/**)",
+      "Bash(curl *)",
+      "Bash(/mnt/c/Users/Jaskran/AppData/Local/Programs/Ollama/ollama.exe serve *)",
+      "Bash(/mnt/c/Windows/System32/taskkill.exe /IM ollama.exe /F)",
+      "Bash(export OLLAMA_HOST=0.0.0.0)",
+      "Bash(/mnt/c/Windows/System32/netstat.exe -ano)",
+      "Bash(/mnt/c/Windows/System32/sc.exe query *)",
+      "Bash(/mnt/c/Windows/System32/tasklist.exe)",
+      "Bash(/mnt/c/Windows/System32/taskkill.exe /IM \"ollama app.exe\" /F)",
+      "Bash(OLLAMA_HOST=0.0.0.0 /mnt/c/Users/Jaskran/AppData/Local/Programs/Ollama/ollama.exe serve)",
+      "Bash(python3 -m json.tool)",
+      "Bash(python3 -c ' *)",
+      "Bash(sudo pg_isready)",
+      "Bash(sudo -u postgres psql -c \"SELECT 1\")",
+      "Bash(dpkg -l)",
+      "Bash(PGPASSWORD=iwm psql *)",
+      "Bash(python -m py_compile backend/config.py)",
+      "Bash(python -m py_compile backend/embeddings.py)",
+      "Bash(python -m py_compile backend/summarize.py)",
+      "Bash(python3 -m py_compile backend/config.py)",
+      "Bash(python3 -m py_compile backend/embeddings.py)",
+      "Bash(python3 -m py_compile backend/summarize.py)",
+      "Bash(python3 *)",
+      "Bash(python *)",
+      "Bash(node --check static/index.html)"
+    ]
+  }
+}
