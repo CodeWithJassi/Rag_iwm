@@ -18,6 +18,7 @@ from pydantic import BaseModel
 
 import judge
 import memory
+import rerank
 import retrieval
 from config import ABSTAIN_MSG, AVAILABLE_MODELS, LLM_MODEL, STATIC_DIR, UPLOAD_DIR
 from db import close_db, execute, init_db, query
@@ -40,6 +41,7 @@ REPORT_COLS = ("id, company, broker, file_name, uploaded_at, summary, recommenda
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     init_db()
+    rerank.preload()  # load reranker model eagerly, not on first query
     yield
     close_db()
 

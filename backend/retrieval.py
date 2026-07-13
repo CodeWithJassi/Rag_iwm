@@ -25,15 +25,27 @@ Two things worth not breaking:
 """
 import logging
 import re
+import threading
 import time
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Callable
 
-from config import (ABSTAIN_MSG, MAX_SUB_QUESTIONS, N_REPHRASINGS_DEEP,
-                    N_REPHRASINGS_NORMAL, RERANK_TOP_K, RRF_K, SIM_GATE,
-                    TOP_K_PER_VARIANT, TOP_K_TEXT, TOP_N_AFTER_FUSION)
+from config import (ABSTAIN_MSG, EMBED_QUERY_PREFIX, MAX_SUB_QUESTIONS,
+                    N_REPHRASINGS_DEEP, N_REPHRASINGS_NORMAL, RERANK_TOP_K,
+                    RRF_K, SIM_GATE, TOP_K_PER_VARIANT, TOP_K_TEXT,
+                    TOP_N_AFTER_FUSION)
 from db import query
-from embeddings import embed_query
+from embeddings import _embed_with_failover, embed_query
+
+
+def embed_queries_batch(texts: list[str]) -> list[list[float]]:
+    """Embed multiple query texts in a single API call — faster than N separate
+    calls when ``retrieve_for`` has multiple rephrasing variants."""
+    if not texts:
+        return []
+    prefixed = [EMBED_QUERY_PREFIX + t for t in texts]
+    return _embed_with_failover(prefixed, timeout=30)
 from llm import llm_complete, llm_json
 from prompts import (CONTEXTUALIZE_PROMPT, DECOMPOSE_PROMPT, REPHRASE_PROMPT,
                      SUB_ANSWER_PROMPT, SYNTHESIZE_PROMPT)
@@ -161,10 +173,16 @@ def rephrase(sub_question: str, n: int = N_REPHRASINGS_NORMAL,
 
 # ------------------------------------------------------------------ search
 
-def vector_search(report_id: int, text: str, k: int = TOP_K_PER_VARIANT) -> list[dict]:
+def vector_search(report_id: int, text: str = "", *,
+                   vec: list[float] | None = None,
+                   k: int = TOP_K_PER_VARIANT) -> list[dict]:
     """Cosine search over one report's chunks. `<=>` is cosine distance, so
-    similarity is 1 - distance."""
-    vec = embed_query(text)
+    similarity is 1 - distance.
+
+    Pass *vec* to skip the embedding call (batch path).  Pass *text* for the
+    legacy one-at-a-time path."""
+    if vec is None:
+        vec = embed_query(text)
     return query(
         """SELECT id, page_no, section, content,
                   1 - (embedding <=> %s::vector) AS similarity
@@ -234,7 +252,9 @@ def retrieve_for(sub_question: str, report_id: int, n_rephrasings: int = N_REPHR
     The abstention gate reads raw cosine from the vector lists ONLY — ts_rank
     scores and reranker scores never influence it (invariant #1)."""
     variants = rephrase(sub_question, n=n_rephrasings, model=model)
-    vec_lists = [vector_search(report_id, v) for v in variants]
+    # Batch-embed all variants in one API call instead of N separate calls.
+    variant_vecs = embed_queries_batch(variants)
+    vec_lists = [vector_search(report_id, vec=v) for v in variant_vecs]
     text_list = text_search(report_id, sub_question)
     # Gate on vector cosine only. Text search ts_rank is not a cosine and must
     # not influence the abstention decision (invariant #1).
@@ -282,9 +302,12 @@ def answer(report: dict, user_query: str, history: list[dict],
     t0 = time.time()
     trace: list[dict] = []
 
+    _trace_lock = threading.Lock()
+
     def _add(label: str, summary: str, detail: str = "") -> None:
-        trace.append({"label": label, "summary": summary, "detail": detail,
-                       "ms": round((time.time() - t0) * 1000)})
+        with _trace_lock:
+            trace.append({"label": label, "summary": summary, "detail": detail,
+                          "ms": round((time.time() - t0) * 1000)})
 
     def _check() -> None:
         if check_cancel:
@@ -310,29 +333,39 @@ def answer(report: dict, user_query: str, history: list[dict],
 
     _check()
 
-    # Retrieve per sub-question, gating each on raw cosine similarity.
+    # Retrieve per sub-question in parallel — each retrieval is an independent
+    # I/O-bound operation (embedding + vector search + text search + rerank).
     retrieved: dict[str, list[dict]] = {}
     gated_out: list[str] = []
-    for sq in sub_questions:
+    _gate_lock = threading.Lock()
+
+    def _retrieve_one(sq: str) -> tuple[str, list[dict] | None, float]:
         _check()
         chunks, max_sim = retrieve_for(sq, report_id, n_rephrasings=n_rephrasings,
                                        model=model)
         if max_sim < SIM_GATE:
             logger.info(f"gate: '{sq}' best sim {max_sim:.3f} < {SIM_GATE} -- skipping")
-            gated_out.append(sq)
+            with _gate_lock:
+                gated_out.append(sq)
             _add("retrieve", f"GATED OUT — best cosine {max_sim:.3f} < {SIM_GATE}",
                  f"\"{sq[:120]}\" — no chunk in this report is close enough")
-            continue
-        # Build a compact summary: each chunk shows cosine → rerank score + page + snippet
+            return sq, None, max_sim
         chunk_lines = []
         for c in chunks[:6]:
             rr = f" → rerank {c.get('rerank_score', 0):.3f}" if c.get('rerank_score') else ""
             snip = c['content'][:80].replace('\n', ' ')
             chunk_lines.append(f"p{c['page_no']} cos={c['similarity']:.3f}{rr} | {snip}…")
-        detail = "\n".join(chunk_lines)
         _add("retrieve", f"✓ {len(chunks)} chunks, best cosine {max_sim:.3f}",
-             detail)
-        retrieved[sq] = chunks
+             "\n".join(chunk_lines))
+        return sq, chunks, max_sim
+
+    workers = min(4, len(sub_questions))
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futures = {ex.submit(_retrieve_one, sq): sq for sq in sub_questions}
+        for fut in as_completed(futures):
+            sq, chunks, _ = fut.result()
+            if chunks is not None:
+                retrieved[sq] = chunks
 
     if not retrieved:  # nothing in this report is close enough to any sub-question
         return {"answer": ABSTAIN_MSG, "abstained": True, "reason": "similarity_gate",
@@ -361,20 +394,29 @@ def answer(report: dict, user_query: str, history: list[dict],
 
     _check()
 
-    # Answer each sub-question from its own chunks only. This is what stops
-    # evidence for one sub-question from bleeding into the answer for another.
-    sub_answers = {}
-    for sq, chunks in retrieved.items():
+    # Answer each sub-question from its own chunks only, in parallel — each
+    # sub-answer is an independent LLM call (I/O-bound).
+    sub_answers: dict[str, str] = {}
+
+    def _answer_one(sq: str, chunks: list[dict]) -> tuple[str, str]:
         _check()
         out = llm_complete(
             SUB_ANSWER_PROMPT.format(company=company, query=sq,
                                      context=_render(chunks, numbering)),
-            max_tokens=600, label="sub_answer", model=model)
+            max_tokens=400, label="sub_answer", model=model)
         ans = _clean_answer(out or "INSUFFICIENT")
-        sub_answers[sq] = ans
         _add("sub_answer",
              "INSUFFICIENT" if _is_empty(ans) else "answered",
              ans[:500] + ("…" if len(ans) > 500 else ""))
+        return sq, ans
+
+    workers = min(4, max(1, len(retrieved)))
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futures = {ex.submit(_answer_one, sq, chunks): sq
+                   for sq, chunks in retrieved.items()}
+        for fut in as_completed(futures):
+            sq, ans = fut.result()
+            sub_answers[sq] = ans
 
     for sq in gated_out:
         sub_answers[sq] = "INSUFFICIENT"
@@ -410,7 +452,7 @@ def answer(report: dict, user_query: str, history: list[dict],
             SYNTHESIZE_PROMPT.format(company=company, query=standalone,
                                      sub_answers=block,
                                      missing_note=missing_note),
-            max_tokens=900, label="synthesize", model=model) or ""
+            max_tokens=600, label="synthesize", model=model) or ""
         _add("synthesize", f"{len(sub_answers)} sub-answers → 1",
              final[:500] + ("…" if len(final) > 500 else ""))
 

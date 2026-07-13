@@ -15,25 +15,30 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 
 from config import (EMBED_BASE_URL, EMBED_BATCH, EMBED_CONCURRENCY, EMBED_DIM,
-                    EMBED_DOC_PREFIX, EMBED_MODEL, EMBED_QUERY_PREFIX)
+                    EMBED_DOC_PREFIX, EMBED_LOCAL_URL, EMBED_MODEL,
+                    EMBED_QUERY_PREFIX)
 
 logger = logging.getLogger(__name__)
 
 
-def _embed_raw(inputs: list[str]) -> list[list[float]]:
-    """POST to Ollama. /api/embed is the batch endpoint; older builds only have
-    /api/embeddings, which is one-at-a-time."""
+def _embed_raw(inputs: list[str], base_url: str = "",
+               timeout: int = 60) -> list[list[float]]:
+    """POST to an Ollama-compatible endpoint.  /api/embed is the batch endpoint;
+    older builds only have /api/embeddings, which is one-at-a-time."""
+    url = base_url or EMBED_BASE_URL
     try:
-        r = requests.post(f"{EMBED_BASE_URL}/api/embed",
-                          json={"model": EMBED_MODEL, "input": inputs}, timeout=300)
+        r = requests.post(f"{url}/api/embed",
+                          json={"model": EMBED_MODEL, "input": inputs},
+                          timeout=timeout)
         r.raise_for_status()
         vecs = r.json()["embeddings"]
     except Exception as e:
-        logger.warning(f"/api/embed failed ({e}); falling back to /api/embeddings")
+        logger.warning(f"/api/embed at {url} failed ({e}); falling back to /api/embeddings")
         vecs = []
         for text in inputs:
-            r = requests.post(f"{EMBED_BASE_URL}/api/embeddings",
-                              json={"model": EMBED_MODEL, "prompt": text}, timeout=300)
+            r = requests.post(f"{url}/api/embeddings",
+                              json={"model": EMBED_MODEL, "prompt": text},
+                              timeout=timeout)
             r.raise_for_status()
             vecs.append(r.json()["embedding"])
 
@@ -42,6 +47,33 @@ def _embed_raw(inputs: list[str]) -> list[list[float]]:
             raise ValueError(f"Expected {EMBED_DIM}-dim vectors, got {len(v)}. "
                              f"Check EMBED_MODEL and the pgvector column width.")
     return vecs
+
+
+def _embed_endpoints() -> list[str]:
+    """Deduplicated failover chain: primary first, then local fallback."""
+    urls, seen = [], set()
+    for u in [EMBED_BASE_URL, EMBED_LOCAL_URL]:
+        u = u.rstrip("/")
+        if u and u not in seen:
+            urls.append(u)
+            seen.add(u)
+    return urls
+
+
+def _embed_with_failover(inputs: list[str], timeout: int = 60) -> list[list[float]]:
+    """Try each embedding endpoint in order. First success wins."""
+    endpoints = _embed_endpoints()
+    last_err = None
+    for i, url in enumerate(endpoints):
+        try:
+            label = "primary" if i == 0 else "fallback"
+            vecs = _embed_raw(inputs, base_url=url, timeout=timeout)
+            logger.info(f"embedded {len(inputs)} texts via {label} ({url})")
+            return vecs
+        except Exception as e:
+            last_err = e
+            logger.warning(f"embedding endpoint {url} failed: {e}")
+    raise last_err or Exception("All embedding endpoints failed")
 
 
 def embed_documents(texts: list[str]) -> list[list[float]]:
@@ -55,14 +87,18 @@ def embed_documents(texts: list[str]) -> list[list[float]]:
         batch = texts[i:i + EMBED_BATCH]
         batches.append([EMBED_DOC_PREFIX + t for t in batch])
 
+    # Batch ingestion may need more time — pass a longer timeout.
+    batch_timeout = 120 if len(batches) > 1 or len(texts) > 16 else 60
+
     if len(batches) == 1:
-        return _embed_raw(batches[0])
+        return _embed_with_failover(batches[0], timeout=batch_timeout)
 
     results: list[list[float]] = [b'' for _ in batches]  # type: ignore[assignment]
     workers = min(EMBED_CONCURRENCY, len(batches))
 
     with ThreadPoolExecutor(max_workers=workers) as ex:
-        fut_to_idx = {ex.submit(_embed_raw, b): idx for idx, b in enumerate(batches)}
+        fut_to_idx = {ex.submit(_embed_with_failover, b, batch_timeout): idx
+                      for idx, b in enumerate(batches)}
         for fut in as_completed(fut_to_idx):
             idx = fut_to_idx[fut]
             results[idx] = fut.result()
@@ -74,5 +110,6 @@ def embed_documents(texts: list[str]) -> list[list[float]]:
 
 
 def embed_query(text: str) -> list[float]:
-    """Embed a single search query."""
-    return _embed_raw([EMBED_QUERY_PREFIX + text])[0]
+    """Embed a single search query.  Uses the failover chain with a short timeout
+    — a single embedding should never take more than 30 seconds."""
+    return _embed_with_failover([EMBED_QUERY_PREFIX + text], timeout=30)[0]

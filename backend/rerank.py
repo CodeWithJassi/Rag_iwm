@@ -101,6 +101,25 @@ def _rerank_remote(query: str, chunks: list[dict], top_k: int,
     return kept
 
 
+def preload() -> None:
+    """Eagerly load the local reranker model so the first query doesn't pay a
+    ~5 s cold-start cost.  Safe to call at import time or during startup."""
+    if RERANK_BASE_URL and not RERANK_BASE_URL.startswith("local://"):
+        return  # remote TEI — nothing to load locally
+    global _local_reranker
+    if _local_reranker is not None:
+        return  # already loaded
+    try:
+        from FlagEmbedding import FlagReranker
+        logger.info("preloading reranker model '%s' ...", RERANK_LOCAL_MODEL)
+        _local_reranker = FlagReranker(RERANK_LOCAL_MODEL, use_fp16=True)
+        logger.info("reranker model ready")
+    except ImportError:
+        logger.info("FlagEmbedding not installed — reranker will load lazily")
+    except Exception as e:
+        logger.warning("reranker preload failed (%s) — will retry on first query", e)
+
+
 def rerank(query: str, chunks: list[dict],
            top_k: int = RERANK_TOP_K) -> list[dict]:
     """Re-score *chunks* against *query* with a cross-encoder and keep the top_k.

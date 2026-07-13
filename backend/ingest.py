@@ -1,13 +1,14 @@
 """Ingestion. Runs in the background on upload; the API returns immediately.
 
-    extract -> summarise -> extract facts -> retrieval-chunk -> embed -> store
+    extract -> (summarise | extract facts | retrieval-chunk) -> embed -> store
 
-Summarisation and retrieval chunking read the same extracted text but chunk it
-differently. Both run on every upload: the summary is what an analyst reads
-first, the chunks are what the chatbot searches.
+Summarisation, fact extraction and retrieval chunking read the same extracted
+text but are independent of each other — they run in parallel to keep the
+slowest step (summarisation, which makes LLM calls) from blocking the others.
 """
 import logging
 import traceback
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from db import execute, pool
 from embeddings import embed_documents
@@ -43,23 +44,31 @@ def ingest_report(report_id: int, pdf_path: str, company: str) -> None:
             return _fail(report_id, "No text could be extracted from the PDF")
         text = full_text(pages)
 
-        # 1) summary -- fall back to a raw snippet if every LLM provider is down,
-        #    so the report is still usable rather than blocking on the chain.
-        summary = summarize_report(text, company)
+        # 1–3) Run summarisation, fact extraction and chunking in parallel.
+        #    Each is independent — all three read from `text`/`pages` but none
+        #    modifies shared state.  The slowest step (summarisation, 30–60 s of
+        #    LLM calls) dominates the critical path; the other two complete for
+        #    free during that wait.
+        with ThreadPoolExecutor(max_workers=3) as ex:
+            fut_summary = ex.submit(summarize_report, text, company)
+            fut_facts = ex.submit(extract_facts, text, company)
+            fut_chunks = ex.submit(retrieval_chunks, pages)
+
+            facts = fut_facts.result()
+            chunks = fut_chunks.result()
+            summary = fut_summary.result()
+
+        # Fall back to a raw snippet if every LLM provider is down.
         if not summary:
             logger.warning(f"report {report_id}: falling back to non-LLM summary")
             summary = text[:1500].strip() + " …"
 
-        # 2) cover-page facts for the dashboard
-        facts = extract_facts(text, company)
-
-        # 3) retrieval chunks + vectors.  A contextual prefix is prepended to
-        #    each chunk before embedding so the vector carries company + section
-        #    identity.  The DB stores the original content — prefix is embed-time
-        #    only (invariant #5).
-        chunks = retrieval_chunks(pages)
         if not chunks:
             return _fail(report_id, "Extraction produced no usable chunks")
+
+        # Embedding: contextual prefix is prepended so the vector carries
+        # company + section identity.  The DB stores the original content —
+        # prefix is embed-time only (invariant #5).
         prefixed = [_prefix(c, company) + c["content"] for c in chunks]
         vectors = embed_documents(prefixed)
 

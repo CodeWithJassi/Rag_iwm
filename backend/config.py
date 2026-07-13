@@ -19,7 +19,7 @@ PG_DSN = os.getenv("PG_DSN", "postgresql://iwm:iwm@localhost:5432/iwm_rag")
 # Failover order is fixed: Ollama first (free, local), paid APIs after.
 LLM_BASE_URL = os.getenv("LLM_BASE_URL", "http://localhost:11434")
 LLM_MODEL = os.getenv("LLM_MODEL", "llama3.1:8b")
-LLM_CYCLES = 2  # full passes through the provider list before giving up
+LLM_CYCLES = 1  # full passes through the provider list before giving up
 
 # Available models exposed in the UI dropdown. Each entry is (model_id, label).
 # The first model is the default. Models must be pulled in Ollama before use.
@@ -36,8 +36,11 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 
 # ---------------------------------------------------------------- embeddings
-# Separate endpoint so embeddings can run locally while the LLM is remote.
+# Failover chain: EMBED_BASE_URL is tried first (defaults to LLM_BASE_URL, which
+# may point to a cluster).  EMBED_LOCAL_URL is the fallback — a local Ollama
+# instance that runs when the cluster is unreachable.
 EMBED_BASE_URL = os.getenv("EMBED_BASE_URL", LLM_BASE_URL)
+EMBED_LOCAL_URL = os.getenv("EMBED_LOCAL_URL", "http://localhost:11434")
 
 # Embedding model registry — every supported model declares its dimension and
 # task prefixes.  Pick one via the EMBED_MODEL env var.  Unknown models raise
@@ -62,10 +65,10 @@ if EMBED_MODEL not in _EMBED_REGISTRY:
     )
 EMBED_DIM, EMBED_DOC_PREFIX, EMBED_QUERY_PREFIX = _EMBED_REGISTRY[EMBED_MODEL]
 
-EMBED_BATCH = 64        # GPU can handle much larger batches than CPU
-EMBED_CONCURRENCY = 2  # parallel batch requests — keeps the GPU fed while one
-                        # batch is in flight. Increase if you have a big GPU
-                        # (A100-class) and Ollama is tuned for it.
+EMBED_BATCH = int(os.getenv("EMBED_BATCH", "128"))
+EMBED_CONCURRENCY = int(os.getenv("EMBED_CONCURRENCY", "8"))
+# Parallel map-phase summarisation chunks sent to the LLM at once.
+SUMMARY_CONCURRENCY = int(os.getenv("SUMMARY_CONCURRENCY", "6"))
 
 # ---------------------------------------------------------------- chunking
 # Two different chunkers for two different jobs. Do not merge them.

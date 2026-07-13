@@ -10,16 +10,11 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from chunking import map_chunks
-from config import MAX_REDUCE_DEPTH, SUMMARY_CHUNK_CHARS
+from config import MAX_REDUCE_DEPTH, SUMMARY_CHUNK_CHARS, SUMMARY_CONCURRENCY
 from llm import llm_complete, llm_json
 from prompts import CHUNK_PROMPT, FACTS_PROMPT, REDUCE_PROMPT
 
 logger = logging.getLogger(__name__)
-
-# How many map chunks to send to the LLM at once. The remote GPU can handle
-# parallel requests; this cuts wall-clock time for the map phase proportionally.
-SUMMARY_CONCURRENCY = 3
-
 
 def summarize_report(text: str, company: str, _depth: int = 0) -> str | None:
     """Map-reduce summary of an arbitrarily large report. None if the LLM fully fails."""

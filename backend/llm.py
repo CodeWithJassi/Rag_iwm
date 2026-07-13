@@ -29,7 +29,7 @@ def _try_ollama(prompt: str, max_tokens: int, model: str = "") -> str:
         f"{LLM_BASE_URL}/api/generate",
         json={"model": effective_model, "prompt": prompt, "stream": False,
               "options": {"temperature": 0.2, "num_predict": max_tokens}},
-        timeout=300,  # 5 min is enough for any on-prem model
+        timeout=180,  # 3 min is enough for any on-prem model
     )
     resp.raise_for_status()
     body = resp.json()
@@ -65,7 +65,7 @@ def _try_ollama(prompt: str, max_tokens: int, model: str = "") -> str:
                 f"{LLM_BASE_URL}/api/generate",
                 json={"model": effective_model, "prompt": prompt, "stream": False,
                       "options": {"temperature": 0.2, "num_predict": max_tokens}},
-                timeout=300,
+                timeout=180,
             )
             resp.raise_for_status()
             body2 = resp.json()
@@ -206,7 +206,7 @@ def llm_complete(prompt: str, max_tokens: int = 700, label: str = "llm",
                 logger.warning(f"[{label}] {name} failed: {e}")
                 continue
         if cycle < LLM_CYCLES - 1:
-            time.sleep(2)
+            time.sleep(0.5)
     logger.error(f"[{label}] all providers failed across {LLM_CYCLES} cycles")
     return None
 
