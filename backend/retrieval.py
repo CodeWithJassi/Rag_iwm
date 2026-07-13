@@ -5,8 +5,10 @@
       -> decompose     (complex becomes N independent sub-questions)
       -> rephrase      (each sub-question becomes N search variants)
       -> vector search (one ranked list per variant, scoped to one report)
+      -> text search   (full-text PostgreSQL tsvector — catches exact terms)
       -> SIMILARITY GATE on raw cosine  <-- abstention decided here
-      -> RRF fusion    (variants collapse into one ranked list per sub-question)
+      -> RRF fusion    (variants + text collapse into one ranked list)
+      -> cross-encoder rerank  (query+passage scored together by bge-reranker)
       -> sub-answer    (each sub-question answered from its own chunks only)
       -> synthesise    (sub-answers combined into the final answer)
 
@@ -23,19 +25,66 @@ Two things worth not breaking:
 """
 import logging
 import re
+import time
 from collections import defaultdict
+from typing import Callable
 
 from config import (ABSTAIN_MSG, MAX_SUB_QUESTIONS, N_REPHRASINGS_DEEP,
-                    N_REPHRASINGS_NORMAL, RRF_K, SIM_GATE, TOP_K_PER_VARIANT,
-                    TOP_K_TEXT, TOP_N_AFTER_FUSION)
+                    N_REPHRASINGS_NORMAL, RERANK_TOP_K, RRF_K, SIM_GATE,
+                    TOP_K_PER_VARIANT, TOP_K_TEXT, TOP_N_AFTER_FUSION)
 from db import query
 from embeddings import embed_query
 from llm import llm_complete, llm_json
 from prompts import (CONTEXTUALIZE_PROMPT, DECOMPOSE_PROMPT, REPHRASE_PROMPT,
                      SUB_ANSWER_PROMPT, SYNTHESIZE_PROMPT)
+from rerank import rerank
 
 logger = logging.getLogger(__name__)
 _CITE = re.compile(r"\[(\d+)\]")
+
+
+def _is_empty(answer: str) -> bool:
+    """True if the answer contains no extractable facts.
+
+    Exact ``INSUFFICIENT`` is empty.  Beyond that, we check for citation
+    markers like ``[1]`` — if the answer cites a passage, the model found and
+    referenced real facts.  No citations = nothing extractable."""
+    a = answer.strip()
+    if a == "INSUFFICIENT":
+        return True
+    # Citation markers mean the model found and referenced real passages.
+    return not bool(_CITE.search(a))
+
+
+def _clean_answer(ans: str) -> str:
+    """Strip a hedging INSUFFICIENT preamble when real content follows.
+
+    Some models write ``INSUFFICIENT`` then immediately provide the facts they
+    did find — the word is a hedge, not a true abstention.  Drop the preamble
+    so the user sees the facts, not the hedge.  If nothing with citations
+    remains, the answer is truly INSUFFICIENT."""
+    a = ans.strip()
+    lines = a.split("\n")
+    # Strip leading lines that are exactly "INSUFFICIENT" (possibly separated
+    # by blank lines).
+    while lines and (not lines[0].strip() or lines[0].strip() == "INSUFFICIENT"):
+        lines.pop(0)
+    if not lines:
+        return "INSUFFICIENT"
+    # If the first remaining line starts with "INSUFFICIENT " followed by
+    # real content, strip just that word.
+    if lines[0].startswith("INSUFFICIENT ") and len(lines[0]) > 13:
+        lines[0] = lines[0][13:].strip()
+    result = "\n".join(lines).strip()
+    # If nothing with a citation remains, the answer is truly empty.
+    if not _CITE.search(result):
+        return "INSUFFICIENT"
+    return result
+
+
+class CancelledError(Exception):
+    """Raised when a user clicks Stop — caught by the endpoint to return a partial result."""
+    pass
 
 
 # ------------------------------------------------------------------ query prep
@@ -62,14 +111,34 @@ def contextualize(user_query: str, history: list[dict], model: str = "") -> str:
 
 
 def decompose(standalone: str, company: str, model: str = "") -> list[str]:
-    """Complex question -> independent sub-questions. Simple questions return [self]."""
+    """Complex question -> independent sub-questions. Simple questions return [self].
+
+    Post-decomposition guards prevent scope drift: if the LLM produced a
+    sub-question that dropped the company name or broadened to industry-level,
+    we fold it back into the standalone question rather than letting bogus
+    sub-questions pollute retrieval and confuse the judge."""
     subs = llm_json(DECOMPOSE_PROMPT.format(company=company, query=standalone,
                                             max_subs=MAX_SUB_QUESTIONS),
                     max_tokens=250, label="decompose", model=model)
     if not isinstance(subs, list) or not subs:
         return [standalone]
-    clean = [str(s).strip() for s in subs if str(s).strip()]
-    return clean[:MAX_SUB_QUESTIONS] or [standalone]
+    clean: list[str] = []
+    company_lower = company.lower()
+    for s in subs:
+        s = str(s).strip()
+        if not s:
+            continue
+        # If the original question mentions a specific company but this
+        # sub-question doesn't, the LLM broadened scope.  Skip it — the
+        # standalone question already covers what the user asked.
+        if company_lower not in s.lower():
+            logger.info("decompose: dropping sub-question that lost company "
+                        "scope — '%s'", s[:100])
+            continue
+        clean.append(s)
+    if not clean:
+        return [standalone]
+    return clean[:MAX_SUB_QUESTIONS]
 
 
 def rephrase(sub_question: str, n: int = N_REPHRASINGS_NORMAL,
@@ -157,19 +226,27 @@ def rrf_fuse(ranked_lists: list[list[dict]], top_n: int = TOP_N_AFTER_FUSION) ->
 
 def retrieve_for(sub_question: str, report_id: int, n_rephrasings: int = N_REPHRASINGS_NORMAL,
                   model: str = "") -> tuple[list[dict], float]:
-    """Search a sub-question every way we know how, fuse, and report the best raw
-    cosine similarity seen -- the gate needs it.
+    """Search a sub-question every way we know how, gate, fuse, rerank.
 
     Hybrid: vector search (n rephrased variants) + full-text search (1 raw query).
-    All lists enter RRF fusion. The abstention gate reads raw cosine from
-    the vector lists ONLY — ts_rank scores never influence the gate."""
+    All lists enter RRF fusion → cross-encoder rerank → top-K.
+
+    The abstention gate reads raw cosine from the vector lists ONLY — ts_rank
+    scores and reranker scores never influence it (invariant #1)."""
     variants = rephrase(sub_question, n=n_rephrasings, model=model)
     vec_lists = [vector_search(report_id, v) for v in variants]
     text_list = text_search(report_id, sub_question)
     # Gate on vector cosine only. Text search ts_rank is not a cosine and must
     # not influence the abstention decision (invariant #1).
     max_sim = max((float(c["similarity"]) for lst in vec_lists for c in lst), default=0.0)
-    return rrf_fuse(vec_lists + [text_list]), max_sim
+
+    # Fuse the ranked lists into one pool, then rerank with a cross-encoder that
+    # reads query+passage together.  The fusion pool is wider (20) than the final
+    # set fed to the generator (6) so the reranker has room to promote good
+    # passages that RRF might have ranked lower.
+    fused = rrf_fuse(vec_lists + [text_list], top_n=TOP_N_AFTER_FUSION)
+    reranked = rerank(sub_question, fused, top_k=RERANK_TOP_K)
+    return reranked, max_sim
 
 
 # ------------------------------------------------------------------ generation
@@ -184,44 +261,83 @@ def _render(chunks: list[dict], numbering: dict[int, int]) -> str:
 
 
 def answer(report: dict, user_query: str, history: list[dict],
-           deep_search: bool = False, model: str = "") -> dict:
+           deep_search: bool = False, model: str = "",
+           verbose: bool = False,
+           check_cancel: Callable[[], None] | None = None) -> dict:
     """Run the full pipeline. Returns everything the UI and the judge need.
 
     Normal mode: contextualize → rephrase → search → answer. One pass, fast.
     Deep-search: also decomposes complex queries into sub-questions and runs
-    more rephrasing variants per sub-question, then validates with the judge."""
+    more rephrasing variants per sub-question, then validates with the judge.
+
+    When *verbose* is True the result includes a ``trace`` list — one entry per
+    pipeline step with label, summary, optional detail, and elapsed ms.  The UI
+    can render this to show exactly what the retriever did.
+
+    *check_cancel*, when provided, is called between pipeline stages.  If the
+    user clicked Stop it raises CancelledError, which the endpoint catches to
+    return a partial result."""
     company = report["company"]
     report_id = report["id"]
+    t0 = time.time()
+    trace: list[dict] = []
+
+    def _add(label: str, summary: str, detail: str = "") -> None:
+        trace.append({"label": label, "summary": summary, "detail": detail,
+                       "ms": round((time.time() - t0) * 1000)})
+
+    def _check() -> None:
+        if check_cancel:
+            check_cancel()
 
     standalone = contextualize(user_query, history, model=model)
+    _add("contextualize", "follow-up → standalone" if history else "already standalone",
+         f"\"{user_query[:120]}\" → \"{standalone[:120]}\"" if history else standalone[:200])
+
+    _check()
 
     # Decomposition only runs in deep-search mode. Normal mode treats the
     # standalone question as the single sub-question — faster and fewer LLM calls.
     if deep_search:
         sub_questions = decompose(standalone, company, model=model)
         n_rephrasings = N_REPHRASINGS_DEEP
+        _add("decompose", f"1 → {len(sub_questions)} sub-question(s)",
+             " · ".join(f"\"{q[:100]}\"" for q in sub_questions))
     else:
         sub_questions = [standalone]
         n_rephrasings = N_REPHRASINGS_NORMAL
-    logger.info(f"'{standalone}' -> {len(sub_questions)} sub-question(s) "
-                f"(deep={deep_search}, rephrasings={n_rephrasings})")
+        _add("decompose", "normal mode — single sub-question", standalone[:200])
+
+    _check()
 
     # Retrieve per sub-question, gating each on raw cosine similarity.
     retrieved: dict[str, list[dict]] = {}
     gated_out: list[str] = []
     for sq in sub_questions:
+        _check()
         chunks, max_sim = retrieve_for(sq, report_id, n_rephrasings=n_rephrasings,
                                        model=model)
         if max_sim < SIM_GATE:
             logger.info(f"gate: '{sq}' best sim {max_sim:.3f} < {SIM_GATE} -- skipping")
             gated_out.append(sq)
+            _add("retrieve", f"GATED OUT — best cosine {max_sim:.3f} < {SIM_GATE}",
+                 f"\"{sq[:120]}\" — no chunk in this report is close enough")
             continue
+        # Build a compact summary: each chunk shows cosine → rerank score + page + snippet
+        chunk_lines = []
+        for c in chunks[:6]:
+            rr = f" → rerank {c.get('rerank_score', 0):.3f}" if c.get('rerank_score') else ""
+            snip = c['content'][:80].replace('\n', ' ')
+            chunk_lines.append(f"p{c['page_no']} cos={c['similarity']:.3f}{rr} | {snip}…")
+        detail = "\n".join(chunk_lines)
+        _add("retrieve", f"✓ {len(chunks)} chunks, best cosine {max_sim:.3f}",
+             detail)
         retrieved[sq] = chunks
 
     if not retrieved:  # nothing in this report is close enough to any sub-question
         return {"answer": ABSTAIN_MSG, "abstained": True, "reason": "similarity_gate",
                 "standalone": standalone, "sub_questions": sub_questions,
-                "citations": [], "context": "", "chunks": []}
+                "citations": [], "context": "", "chunks": [], "trace": trace}
 
     # Global passage numbering, assigned in order of first appearance. Keeps [n]
     # unambiguous once the sub-answers are synthesised together.
@@ -232,6 +348,10 @@ def answer(report: dict, user_query: str, history: list[dict],
                 numbering[c["id"]] = len(numbering) + 1
                 all_chunks.append(c)
 
+    _add("fuse", f"{len(all_chunks)} unique chunks across {len(retrieved)} "
+                 f"sub-question(s)",
+         f"chunk IDs: {sorted(numbering.values())}")
+
     # Cap the context fed to the judge. When many chunks are retrieved the prompt
     # overflows the model's effective attention window — which makes it score
     # conservatively (failing closed) even on good answers.
@@ -239,37 +359,66 @@ def answer(report: dict, user_query: str, history: list[dict],
     judge_context = _render(all_chunks[:MAX_JUDGE_CHUNKS], numbering) \
         if len(all_chunks) > MAX_JUDGE_CHUNKS else None
 
+    _check()
+
     # Answer each sub-question from its own chunks only. This is what stops
     # evidence for one sub-question from bleeding into the answer for another.
     sub_answers = {}
     for sq, chunks in retrieved.items():
+        _check()
         out = llm_complete(
             SUB_ANSWER_PROMPT.format(company=company, query=sq,
                                      context=_render(chunks, numbering)),
             max_tokens=600, label="sub_answer", model=model)
-        sub_answers[sq] = (out or "INSUFFICIENT").strip()
+        ans = _clean_answer(out or "INSUFFICIENT")
+        sub_answers[sq] = ans
+        _add("sub_answer",
+             "INSUFFICIENT" if _is_empty(ans) else "answered",
+             ans[:500] + ("…" if len(ans) > 500 else ""))
 
     for sq in gated_out:
         sub_answers[sq] = "INSUFFICIENT"
 
-    if all(a.startswith("INSUFFICIENT") for a in sub_answers.values()):
-        return {"answer": ABSTAIN_MSG, "abstained": True, "reason": "no_grounded_sub_answer",
+    if all(_is_empty(a) for a in sub_answers.values()):
+        return {"answer": ABSTAIN_MSG, "abstained": True,
+                "reason": "no_grounded_sub_answer",
                 "standalone": standalone, "sub_questions": sub_questions,
-                "citations": [], "context": "", "chunks": []}
+                "citations": [], "context": "", "chunks": [], "trace": trace}
+
+    _check()
 
     # Single sub-question: the sub-answer *is* the answer. Skip a pointless LLM call.
     if len(sub_answers) == 1:
         final = next(iter(sub_answers.values()))
+        _add("synthesize", "single sub-question — used as-is", "")
     else:
-        block = "\n\n".join(f"SUB-QUESTION: {q}\nANSWER: {a}" for q, a in sub_answers.items())
+        # Separate real answers from INSUFFICIENT ones. Only the real answers go
+        # into the synthesis block — the LLM should never see "INSUFFICIENT" as
+        # raw material to paste into its output. Missing facets are noted in the
+        # prompt so the LLM can acknowledge gaps honestly.
+        good = {q: a for q, a in sub_answers.items()
+                if not _is_empty(a)}
+        missing = [q for q, a in sub_answers.items()
+                   if _is_empty(a)]
+        missing_note = ""
+        if missing:
+            missing_note = ("The following facets could NOT be answered from the "
+                            "report:\n" + "\n".join(f"- {q}" for q in missing))
+        block = "\n\n".join(f"SUB-QUESTION: {q}\nANSWER: {a}"
+                            for q, a in good.items())
         final = llm_complete(
-            SYNTHESIZE_PROMPT.format(company=company, query=standalone, sub_answers=block),
+            SYNTHESIZE_PROMPT.format(company=company, query=standalone,
+                                     sub_answers=block,
+                                     missing_note=missing_note),
             max_tokens=900, label="synthesize", model=model) or ""
+        _add("synthesize", f"{len(sub_answers)} sub-answers → 1",
+             final[:500] + ("…" if len(final) > 500 else ""))
 
-    if not final.strip() or final.strip().startswith("INSUFFICIENT"):
-        return {"answer": ABSTAIN_MSG, "abstained": True, "reason": "generator_abstained",
+    if not final.strip() or _is_empty(final.strip()):
+        return {"answer": ABSTAIN_MSG, "abstained": True,
+                "reason": "generator_abstained",
                 "standalone": standalone, "sub_questions": sub_questions,
-                "citations": [], "context": "", "chunks": []}
+                "citations": [], "context": "", "chunks": [], "trace": trace}
 
     # Resolve the [n] markers the generator actually used back to real chunks.
     cited_nums = {int(n) for n in _CITE.findall(final)}
@@ -317,4 +466,5 @@ def answer(report: dict, user_query: str, history: list[dict],
         # window, which made deep-search mode score conservatively on good answers.
         "context": judge_context or _render(all_chunks, numbering),
         "chunks": all_chunks,
+        "trace": trace,
     }

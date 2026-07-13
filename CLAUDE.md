@@ -27,8 +27,8 @@ the things that will bite you if you change code without knowing them.
 | API | FastAPI | Existing house stack |
 | DB + vectors | Postgres 16 + pgvector | One service holds documents, chunks, vectors and chat memory |
 | LLM | Ollama (`llama3.1:8b`) with API failover | Local first, paid providers only when it fails |
-| Embeddings | Ollama (`nomic-embed-text`), 768-dim | Same Ollama process. No new infra |
-| Rerank | RRF, plain Python | No model, no dependency |
+| Embeddings | Ollama (3 models supported, see `_EMBED_REGISTRY` in config.py) | Same Ollama process. No new infra |
+| Rerank | bge-reranker-v2-m3 via FlagEmbedding (local), or TEI container (remote) | Cross-encoder scores query+passage together |
 | Frontend | One vanilla HTML file, served by FastAPI | No build step for an internal tool |
 
 **There is no Redis.** Session memory is the `turns` table. Do not add Redis; the
@@ -47,12 +47,14 @@ backend/
   config.py       every tunable constant. Nothing else hardcodes one.
   prompts.py      every prompt. Iterate prompts without touching pipeline code.
   llm.py          provider failover chain. All LLM calls go through llm_complete().
-  embeddings.py   nomic-embed-text via Ollama
+  embeddings.py   embedding model via Ollama (see _EMBED_REGISTRY in config.py)
   db.py           schema, connection pool, query()/execute() helpers
   extract.py      tiered PDF text extraction, page-aware
   chunking.py     TWO chunkers. See below.
   summarize.py    map-reduce summary + extract_facts()
   ingest.py       upload orchestrator (background task)
+  rerank.py       cross-encoder reranker (local or TEI remote)
+  rerank.py       cross-encoder reranker (local or TEI remote)
   retrieval.py    the query pipeline. The heart of the system.
   judge.py        deep-search validation
   memory.py       sessions + turns
@@ -104,15 +106,20 @@ answer that cannot be verified against its own sources is not an answer.
 The judge grades against **all** retrieved chunks the generator could see, not
 just the ones it cited — otherwise an uncited hallucination would score well.
 
-### 5. nomic-embed-text requires task prefixes
+### 5. Embedding models require the right task prefixes
 
-`search_document: ` on ingestion, `search_query: ` on retrieval. The model was
-trained with them and retrieval quality measurably drops without them. They are
-applied at embed time only and never stored in `chunks.content`.
+Each embedding model in `_EMBED_REGISTRY` declares its own task prefixes.
+nomic-embed-text REQUIRES `search_document: ` on ingestion and `search_query: `
+on retrieval. mxbai-embed-large and qwen3-embedding work correctly without
+prefixes. Prefixes are applied at embed time only and never stored in
+`chunks.content`.
 
-If you change `EMBED_MODEL`, you must also change `EMBED_DIM` **and** migrate
-the `chunks.embedding vector(768)` column **and** re-embed every chunk. There is
-no dimension check at query time; a mismatch surfaces as a Postgres error.
+When you change `EMBED_MODEL`, the system auto-migrates the `chunks.embedding`
+column to the new dimension on startup — but existing vectors are dropped (they
+are useless in a different model's embedding space). You MUST re-ingest every
+report. A dimension mismatch between Ollama's output and the pgvector column
+would otherwise surface as a cryptic Postgres error; the startup check prevents
+that.
 
 ---
 
@@ -140,13 +147,15 @@ for every chunk that opened with its own heading. Do not reintroduce that.
 
 ```bash
 docker compose up -d                                  # postgres + pgvector
-ollama pull nomic-embed-text && ollama pull llama3.1:8b
+ollama pull nomic-embed-text && ollama pull llama3.1:8b    # or mxbai-embed-large / qwen3-embedding
 cp .env.example .env
 pip install -r requirements.txt
 cd backend && uvicorn main:app --reload                # http://localhost:8000
 ```
 
-Schema is created on first boot by `init_db()`. Nothing to migrate by hand.
+Schema is created on first boot by `init_db()`. The embedding column is
+auto-migrated when you switch models. Reports must be re-ingested after a model
+change.
 
 Ingestion runs as a FastAPI `BackgroundTask`. The upload endpoint returns `202`
 immediately and the UI polls `reports.status` until it flips `pending →
@@ -178,8 +187,8 @@ pure functions and should be tested first — they are where the subtle bugs liv
 ## Calibration is not optional
 
 `SIM_GATE = 0.55`, `FAITHFULNESS_MIN = 0.7`, `RELEVANCY_MIN = 0.6` are
-**placeholders**. Cosine distributions are model-specific; nomic's are not
-OpenAI's.
+**placeholders**. Cosine distributions are model-specific; each embedding
+model produces a different range of cosine similarities.
 
 Before trusting output in front of the team: take ten real broker PDFs, write
 five answerable and five unanswerable questions for each, and move the threshold
@@ -197,13 +206,6 @@ not contain the answer.
   pipeline is agnostic to it. Emit them as chunks (`table` / `image`) and
   retrieval, citation and the UI work unchanged. Stubs at the bottom of
   `extract.py`.
-- **Hybrid retrieval.** Add a Postgres `tsvector` full-text ranked list as a
-  fourth input to the same `rrf_fuse()` call. Catches exact terms — tickers,
-  "EBITDA margin", broker names — that dense retrieval misses. Zero new infra.
-  This is the highest-value next change.
-- **Cross-encoder reranker.** Slots in *after* fusion: fuse to top-20, rerank to
-  top-6. `bge-reranker-v2-m3` behind a TEI container. Nothing else changes.
-  Do not add this before hybrid retrieval; it is more infra for less gain.
 
 ---
 
@@ -214,8 +216,9 @@ full. In particular, for this repo:
 
 - **State assumptions before implementing.** If a change could break one of the
   five invariants above, say so and stop.
-- **No speculative abstraction.** There is one report type, one embedding model
-  and one vector store. Do not build a provider interface for a second one.
+- **No speculative abstraction.** There is one report type, one vector store.
+  Three embedding models are supported via the registry; don't build a provider
+  interface for a fourth one.
 - **Constants go in `config.py`, prompts go in `prompts.py`.** Never inline
   either.
 - **Match the existing style**: minimal code, comments that explain *why* not

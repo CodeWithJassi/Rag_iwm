@@ -18,6 +18,16 @@ from summarize import extract_facts, summarize_report
 logger = logging.getLogger(__name__)
 
 
+def _prefix(chunk: dict, company: str) -> str:
+    """Assemble a contextual prefix for embedding so the vector carries company
+    and section identity, not just bare sentence text.  Never stored in the DB —
+    ``chunks.content`` stays clean (invariant #5)."""
+    parts = [company]
+    if chunk.get("section"):
+        parts.append(chunk["section"])
+    return " — ".join(parts) + ": "
+
+
 def _fail(report_id: int, msg: str) -> None:
     execute("UPDATE reports SET status='failed', error=%s WHERE id=%s", (msg[:500], report_id))
     logger.error(f"report {report_id} failed: {msg}")
@@ -43,11 +53,15 @@ def ingest_report(report_id: int, pdf_path: str, company: str) -> None:
         # 2) cover-page facts for the dashboard
         facts = extract_facts(text, company)
 
-        # 3) retrieval chunks + vectors
+        # 3) retrieval chunks + vectors.  A contextual prefix is prepended to
+        #    each chunk before embedding so the vector carries company + section
+        #    identity.  The DB stores the original content — prefix is embed-time
+        #    only (invariant #5).
         chunks = retrieval_chunks(pages)
         if not chunks:
             return _fail(report_id, "Extraction produced no usable chunks")
-        vectors = embed_documents([c["content"] for c in chunks])
+        prefixed = [_prefix(c, company) + c["content"] for c in chunks]
+        vectors = embed_documents(prefixed)
 
         # 4) one transaction: chunks and report metadata land together, so a
         #    report is never marked 'ready' with a half-written chunk table.

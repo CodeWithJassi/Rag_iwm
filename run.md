@@ -34,3 +34,22 @@ cd backend && uvicorn main:app --reload
 Then open http://localhost:8000 in your browser.
 
 ---
+
+#########################################################################
+
+# switch embedding model
+How to switch models
+
+# 1. Set the model in .env
+echo 'EMBED_MODEL=mxbai-embed-large:latest' >> .env
+
+# 2. Restart — the column auto-migrates, existing vectors are dropped
+cd backend && uvicorn main:app --reload
+
+# 3. Re-ingest every report (the old vectors are gone)
+
+The startup logs will show a big warning box confirming the migration happened.
+
+#########################################################################
+
+To use the new chunking strategy, set CHUNKING_STRATEGY=structure in .env.

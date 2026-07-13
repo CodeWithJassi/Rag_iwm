@@ -35,7 +35,10 @@
       "Bash(python3 -m py_compile backend/summarize.py)",
       "Bash(python3 *)",
       "Bash(python *)",
-      "Bash(node --check static/index.html)"
+      "Bash(node --check static/index.html)",
+      "Bash(./venv/bin/pip install *)",
+      "Bash(./venv/bin/python3 *)",
+      "Bash(node --check -)"
     ]
   }
 }

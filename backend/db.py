@@ -9,7 +9,7 @@ import logging
 from pgvector.psycopg import register_vector
 from psycopg_pool import ConnectionPool
 
-from config import EMBED_DIM, PG_DSN
+from config import EMBED_DIM, EMBED_MODEL, PG_DSN
 
 logger = logging.getLogger(__name__)
 
@@ -91,6 +91,70 @@ pool = ConnectionPool(PG_DSN, min_size=1, max_size=8, open=False,
                       configure=register_vector)
 
 
+def _check_embedding_dimension() -> None:
+    """Verify chunks.embedding column matches EMBED_DIM. Auto-migrate on mismatch.
+
+    Embedding models produce different dimension vectors.  If the pgvector column
+    is the wrong width, INSERT will fail with a cryptic Postgres error.  This
+    check catches the mismatch at startup and auto-migrates — dropping the old
+    vectors (they are useless in the new model's space anyway) and resizing the
+    column.  The caller MUST re-ingest every report afterwards.
+    """
+    with pool.connection() as conn:
+        exists = conn.execute(
+            "SELECT EXISTS ("
+            "  SELECT FROM information_schema.tables WHERE table_name = 'chunks'"
+            ")"
+        ).fetchone()[0]
+        if not exists:
+            return  # table not created yet — SCHEMA will use the right dim
+
+        result = conn.execute(
+            "SELECT format_type(atttypid, atttypmod) "
+            "FROM pg_attribute "
+            "WHERE attrelid = 'chunks'::regclass "
+            "  AND attname = 'embedding' AND attnum > 0"
+        ).fetchone()
+
+        if not result:
+            return  # column doesn't exist yet — shouldn't happen
+
+        col_type: str = result[0]  # e.g. "vector(768)"
+        if not col_type.startswith("vector("):
+            logger.warning("unexpected embedding column type '%s' — "
+                           "skipping dimension check", col_type)
+            return
+
+        actual_dim = int(col_type[7:-1])
+        if actual_dim == EMBED_DIM:
+            return  # all good
+
+        logger.warning(
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "EMBEDDING DIMENSION MISMATCH\n"
+            "  DB column:      vector(%d)\n"
+            "  Config expects: vector(%d)  (model '%s')\n"
+            "\n"
+            "Auto-migrating now.  Existing vectors will be dropped — they\n"
+            "were produced by a different model and cannot be used for\n"
+            "retrieval in the new embedding space.\n"
+            "\n"
+            "You MUST re-ingest every report.  Until then, queries will\n"
+            "fail because chunks lack valid embeddings.\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+            actual_dim, EMBED_DIM, EMBED_MODEL)
+
+        conn.execute("DROP INDEX IF EXISTS chunks_embed_idx")
+        conn.execute("ALTER TABLE chunks DROP COLUMN embedding")
+        conn.execute(f"ALTER TABLE chunks ADD COLUMN embedding vector({EMBED_DIM})")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS chunks_embed_idx "
+            "ON chunks USING hnsw (embedding vector_cosine_ops)"
+        )
+        logger.info("migrated chunks.embedding from vector(%d) to vector(%d). "
+                    "All reports must be re-ingested.", actual_dim, EMBED_DIM)
+
+
 def init_db() -> None:
     # Create the pgvector extension FIRST on a raw connection — the pool's
     # configure=register_vector callback needs the vector type to exist before
@@ -109,6 +173,10 @@ def init_db() -> None:
         for m in MIGRATIONS:
             conn.execute(m)
     logger.info("schema ready")
+
+    # After the schema is confirmed to exist, verify the embedding column width
+    # matches the configured model.  Auto-migrates with a warning on mismatch.
+    _check_embedding_dimension()
 
 
 def close_db() -> None:

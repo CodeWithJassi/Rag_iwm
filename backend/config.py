@@ -26,6 +26,8 @@ LLM_CYCLES = 2  # full passes through the provider list before giving up
 AVAILABLE_MODELS = [
     ("llama3.1:8b", "Llama 3.1 8B"),
     ("gemma4:26b", "Gemma 4 26B"),
+    ("MichelRosselli/GLM-4.5-Air:Q4_K_M", "GLM-4.5 Q4"),
+    ("MichelRosselli/GLM-4.5-Air:IQ1_M", "GLM-4.5 Q1")
 ]
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
@@ -36,16 +38,34 @@ OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 # ---------------------------------------------------------------- embeddings
 # Separate endpoint so embeddings can run locally while the LLM is remote.
 EMBED_BASE_URL = os.getenv("EMBED_BASE_URL", LLM_BASE_URL)
+
+# Embedding model registry — every supported model declares its dimension and
+# task prefixes.  Pick one via the EMBED_MODEL env var.  Unknown models raise
+# an error at import time; add new entries here before using a new model.
+#
+# nomic-embed-text REQUIRES its task prefixes — retrieval quality drops
+# measurably without them.  mxbai and qwen3 were trained without mandatory
+# prefixes and work correctly with empty strings.
+_EMBED_REGISTRY: dict[str, tuple[int, str, str]] = {
+    "nomic-embed-text:latest":  (768,  "search_document: ", "search_query: "),
+    "mxbai-embed-large:latest": (1024, "",                  ""),
+    "qwen3-embedding:4b":       (2560, "",                  ""),
+}
+
 EMBED_MODEL = os.getenv("EMBED_MODEL", "nomic-embed-text:latest")
-EMBED_DIM = 768  # nomic-embed-text output dim. Must match the pgvector column.
+if EMBED_MODEL not in _EMBED_REGISTRY:
+    raise ValueError(
+        f"Unknown EMBED_MODEL '{EMBED_MODEL}'. "
+        f"Known models: {list(_EMBED_REGISTRY.keys())}. "
+        f"Add the new model to _EMBED_REGISTRY in config.py with its dimension "
+        f"and task prefixes before using it."
+    )
+EMBED_DIM, EMBED_DOC_PREFIX, EMBED_QUERY_PREFIX = _EMBED_REGISTRY[EMBED_MODEL]
+
 EMBED_BATCH = 64        # GPU can handle much larger batches than CPU
 EMBED_CONCURRENCY = 2  # parallel batch requests — keeps the GPU fed while one
                         # batch is in flight. Increase if you have a big GPU
                         # (A100-class) and Ollama is tuned for it.
-# nomic-embed-text is trained with task prefixes. Retrieval quality drops
-# measurably without them. Applied at embed time only; never stored.
-EMBED_DOC_PREFIX = "search_document: "
-EMBED_QUERY_PREFIX = "search_query: "
 
 # ---------------------------------------------------------------- chunking
 # Two different chunkers for two different jobs. Do not merge them.
@@ -53,8 +73,27 @@ SUMMARY_CHUNK_CHARS = 12000   # map-reduce summarisation: big chunks, few LLM ca
 MAX_MAP_CHUNKS = 12
 MAX_REDUCE_DEPTH = 2
 
-RETRIEVAL_CHUNK_CHARS = 1200 #1800  # ~450 tokens. Dense chunks for vector search.
-RETRIEVAL_CHUNK_OVERLAP = 250 #250
+RETRIEVAL_CHUNK_CHARS = 2100  # max chars per retrieval chunk (all strategies)
+RETRIEVAL_CHUNK_OVERLAP = 250 # overlap for sliding-window strategy only
+
+# Retrieval chunking strategy. Pick one:
+#   "char"     — fixed-size sliding window + overlap (fast, no model needed)
+#   "heading"  — splits at markdown heading boundaries; long sections fall back
+#                to char-splitting. Keeps thematic sections together.
+#   "semantic" — uses the LLM to detect topic shifts and split at natural
+#                context boundaries. Best coherence, slowest ingestion.
+CHUNKING_STRATEGY = os.getenv("CHUNKING_STRATEGY", "structure")
+
+# Semantic chunking: max chars per LLM call when finding split points.
+# Larger = fewer LLM calls but coarser splits.
+SEMANTIC_CHUNK_BLOCK = 4000
+
+# Structure-aware chunking (strategy "structure"): split at bold Label: lead-ins
+# found in earnings-call sections.  Each labeled block is its own chunk; only
+# merge when below the floor (~30 tokens) and split when above the ceiling
+# (~400 tokens).  Char counts are proxy for token counts.
+STRUCTURE_FLOOR_CHARS = 120     # merge smaller chunks into previous neighbor
+STRUCTURE_CEILING_CHARS = 1600  # split larger chunks with char-level fallback
 
 # ---------------------------------------------------------------- retrieval
 MAX_SUB_QUESTIONS = 3     # cap on complex-query decomposition (deep-search only)
@@ -62,18 +101,35 @@ N_REPHRASINGS_NORMAL = 1  # search variants in normal mode (faster, fewer LLM ca
 N_REPHRASINGS_DEEP = 3    # search variants in deep-search mode (thorough)
 TOP_K_PER_VARIANT = 20    # vector hits fetched per rephrasing
 TOP_K_TEXT = 20            # full-text hits fetched per sub-question
-TOP_N_AFTER_FUSION = 10    # chunks handed to the generator per sub-question
+TOP_N_AFTER_FUSION = 35    # chunks after RRF fusion — pool fed to the reranker
 
 RRF_K = 60                # standard reciprocal-rank-fusion constant
 
+# Cross-encoder reranker. Sits between fusion and generation: the reranker reads
+# the query and every passage *together* (not as independent vectors), so its
+# relevance scores are much sharper than cosine or RRF.  bge-reranker-v2-m3 is
+# the standard choice.
+#
+# Two modes, controlled by RERANK_BASE_URL:
+#   LOCAL (default) — when RERANK_BASE_URL is empty or starts with "local://".
+#        Loads the model in-process via FlagEmbedding.  No extra container needed.
+#        First query pays a ~5 s model-load cost; subsequent queries are fast.
+#   REMOTE — set RERANK_BASE_URL to a TEI container endpoint.
+#        docker run -d -p 8080:80 --gpus all \
+#            ghcr.io/huggingface/text-embeddings-inference:latest \
+#            --model-id BAAI/bge-reranker-v2-m3
+RERANK_BASE_URL = os.getenv("RERANK_BASE_URL", "")
+RERANK_LOCAL_MODEL = os.getenv("RERANK_LOCAL_MODEL", "BAAI/bge-reranker-v2-m3")
+RERANK_TOP_K = 6          # chunks handed to the generator after reranking
+
 # ABSTENTION GATE. Must run on raw cosine similarity, never on RRF scores --
 # RRF is rank-based and its top result scores well even on garbage retrieval.
-SIM_GATE = 0.4           # calibrate on your own reports; nomic-specific
+SIM_GATE = 0.40          # calibrate on your own reports; nomic-specific
 
 # ---------------------------------------------------------------- deep search
 # LLM-as-judge thresholds. Only applied when deep_search=true on a query.
-FAITHFULNESS_MIN = 0.5    # is the answer entailed by the retrieved chunks
-RELEVANCY_MIN = 0.3       # do the chunks actually address the question
+FAITHFULNESS_MIN = 0.7    # is the answer entailed by the retrieved chunks
+RELEVANCY_MIN = 0.6       # do the chunks actually address the question
 JUDGE_MAX_TOKENS = 200
 
 ABSTAIN_MSG = "I don't have enough information in this report to answer that."

@@ -1,8 +1,15 @@
 """FastAPI app. Serves the dashboard and the six endpoints behind it."""
 import logging
 import shutil
+import threading
 import uuid
+import warnings
 from contextlib import asynccontextmanager
+
+# pymupdf (fitz) allocates internal semaphores that Python 3.12's resource
+# tracker warns about on Ctrl+C.  Harmless — the OS reclaims them.  Suppress
+# the noise so the terminal stays readable.
+warnings.filterwarnings("ignore", message=".*leaked semaphore.*")
 
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
@@ -19,6 +26,12 @@ from ingest import ingest_report
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(name)s | %(message)s")
 logger = logging.getLogger(__name__)
+
+# Per-session cancel tokens.  The chat endpoint checks these between pipeline
+# stages; the cancel endpoint sets them.  A Lock guards dict mutation, though
+# for a single-user internal tool contention is essentially zero.
+_cancel: dict[int, threading.Event] = {}
+_cancel_lock = threading.Lock()
 
 REPORT_COLS = ("id, company, broker, file_name, uploaded_at, summary, recommendation, "
                "current_price, target_price, n_chunks, status, error")
@@ -38,6 +51,7 @@ class ChatRequest(BaseModel):
     query: str
     deep_search: bool = False
     model: str = ""  # empty -> use LLM_MODEL default
+    verbose: bool = False  # return pipeline trace for the UI to render
 
 
 def _get_report(report_id: int) -> dict:
@@ -152,19 +166,35 @@ def chat(session_id: int, req: ChatRequest):
     memory.add_turn(session_id, "user", user_query)
     memory.autotitle(session_id, user_query)
 
-    result = retrieval.answer(report, user_query, history,
-                              deep_search=req.deep_search, model=req.model)
+    # Register a cancel token for this session so the Stop button can interrupt
+    # the pipeline between stages.  Cleaned up in the finally block.
+    evt = threading.Event()
+    with _cancel_lock:
+        _cancel[session_id] = evt
 
-    # Deep search: grade the answer, and withhold it if it fails. An answer that
-    # cannot be verified against its own sources is worse than no answer here --
-    # this desk acts on these numbers.
+    def _check_cancel() -> None:
+        if evt.is_set():
+            raise retrieval.CancelledError("user clicked Stop")
+
+    try:
+        result = retrieval.answer(report, user_query, history,
+                                  deep_search=req.deep_search, model=req.model,
+                                  verbose=req.verbose, check_cancel=_check_cancel)
+    except retrieval.CancelledError:
+        logger.info("chat cancelled by user for session %d", session_id)
+        result = {"answer": "⏹ Stopped.", "abstained": True, "reason": "cancelled",
+                  "standalone": user_query, "sub_questions": [],
+                  "citations": [], "context": "", "chunks": [], "trace": []}
+    finally:
+        with _cancel_lock:
+            _cancel.pop(session_id, None)
+
+    # Deep search: grade the answer and attach scores so the analyst can see them.
+    # The answer is always returned — the scores are advisory, not a gate.
     scores = None
     if req.deep_search and not result["abstained"]:
         scores = judge.validate(result["standalone"], result["context"],
                                 result["answer"], model=req.model)
-        if not scores["passed"]:
-            result.update(answer=ABSTAIN_MSG, abstained=True,
-                          reason="judge_failed", citations=[])
 
     memory.add_turn(session_id, "assistant", result["answer"],
                     standalone=result["standalone"],
@@ -175,7 +205,23 @@ def chat(session_id: int, req: ChatRequest):
     return {"answer": result["answer"], "abstained": result["abstained"],
             "reason": result["reason"], "standalone": result["standalone"],
             "sub_questions": result["sub_questions"], "citations": result["citations"],
-            "scores": scores}
+            "scores": scores,
+            "trace": result.get("trace", [])}
+
+
+@app.post("/api/sessions/{session_id}/cancel", status_code=200)
+def cancel_chat(session_id: int):
+    """Signal the in-flight chat pipeline for this session to stop.
+
+    The chat endpoint checks the cancel token between pipeline stages.  If the
+    token is set it raises CancelledError, which is caught to return a partial
+    result.  Idempotent — calling it when nothing is running is a no-op."""
+    with _cancel_lock:
+        evt = _cancel.get(session_id)
+    if evt:
+        evt.set()
+        logger.info("cancel requested for session %d", session_id)
+    return {"cancelled": True}
 
 
 @app.get("/api/chunks/{chunk_id}")

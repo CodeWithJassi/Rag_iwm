@@ -58,6 +58,20 @@ header{
 .deep[data-on="1"] .switch{background:var(--accent)}
 .deep[data-on="1"] .switch::after{transform:translateX(13px);background:#fff}
 
+.verbose{
+  display:flex;align-items:center;gap:9px;font-size:13px;color:var(--muted);
+  padding:6px 11px;border:1px solid var(--line);border-radius:20px;
+}
+.verbose[data-on="1"]{border-color:var(--accent);color:var(--text);background:var(--accent-dim)}
+.verbose[data-on="1"] .switch{background:var(--accent)}
+.verbose[data-on="1"] .switch::after{transform:translateX(13px);background:#fff}
+
+.stop-btn{
+  width:31px;height:31px;border-radius:7px;background:var(--sell);color:#fff;
+  display:grid;place-items:center;font-size:13px;flex-shrink:0;
+}
+.stop-btn:hover{filter:brightness(1.2)}
+
 .model-sel{
   font-family:var(--mono);font-size:11px;color:var(--muted);
   background:var(--raise);border:1px solid var(--line);border-radius:5px;
@@ -233,6 +247,35 @@ aside{
 .plan{font-size:13px;color:var(--muted)}
 .plan li{margin:3px 0 3px 16px}
 
+/* trace panel — shown inline when verbose is on, no click needed */
+.trace-panel{
+  margin-top:14px;border:1px solid var(--line);border-radius:8px;
+  background:var(--panel);overflow:hidden;
+}
+.trace-head{
+  font-family:var(--mono);font-size:10px;letter-spacing:.1em;color:var(--muted);
+  padding:8px 14px;border-bottom:1px solid var(--line);
+  display:flex;justify-content:space-between;align-items:center;
+}
+.trace-head span{color:var(--accent)}
+.trace-steps{padding:6px 0}
+.trace-step{
+  display:flex;align-items:flex-start;gap:10px;padding:6px 14px;font-size:12px;
+}
+.trace-step+.trace-step{border-top:1px solid color-mix(in srgb,var(--line) 40%,transparent)}
+.trace-label{
+  font-family:var(--mono);font-size:9px;letter-spacing:.1em;color:var(--accent);
+  padding:2px 6px;border:1px solid var(--accent-dim);border-radius:3px;
+  min-width:80px;text-align:center;flex-shrink:0;background:var(--accent-dim);
+}
+.trace-label.gate{border-color:var(--sell);color:var(--sell);background:transparent}
+.trace-summary{color:var(--text);flex:1;line-height:1.45}
+.trace-detail{
+  color:var(--muted);font-size:11px;margin-top:2px;word-break:break-word;
+  max-height:200px;overflow-y:auto;white-space:pre-wrap;line-height:1.5;
+}
+.trace-ms{font-family:var(--mono);font-size:9px;color:var(--faint);min-width:42px;text-align:right;flex-shrink:0}
+
 .scores{display:flex;gap:18px;margin-top:11px}
 .score-k{font-family:var(--mono);font-size:10px;color:var(--faint);letter-spacing:.08em}
 .score-v{font-family:var(--mono);font-size:13px;margin-top:2px}
@@ -293,6 +336,9 @@ aside{
   <button class="deep" id="deep" data-on="0" aria-pressed="false">
     <span class="switch"></span> Deep search
   </button>
+  <button class="verbose" id="verbose" data-on="0" aria-pressed="false">
+    <span class="switch"></span> Verbose
+  </button>
 </header>
 
 <main>
@@ -319,7 +365,8 @@ aside{
 // ============================================================
 // State. One report selected, one session inside it. Nothing else.
 // ============================================================
-const S = { reports: [], report: null, sessions: [], session: null, turns: [], deep: false, busy: false, model: '' };
+const S = { reports: [], report: null, sessions: [], session: null, turns: [], deep: false, verbose: false, busy: false, model: '' };
+let _abort = null;  // AbortController for in-flight chat fetch
 const api = async (path, opts = {}) => {
   const r = await fetch('/api' + path, opts);
   if (r.status === 204) return null;
@@ -518,6 +565,7 @@ function renderStage(force) {
       <div class="box">
         <textarea id="q" rows="1" placeholder="Ask about ${esc(r.company)} — figures, thesis, risks, assumptions"></textarea>
         <button class="send" id="send" aria-label="Send">↑</button>
+        <button class="stop-btn" id="stop" aria-label="Stop" style="display:none">■</button>
       </div>
       <div class="hint">ANSWERS ARE GROUNDED IN THIS REPORT ONLY · ENTER TO SEND</div>
     </div>` : ''}`;
@@ -529,6 +577,8 @@ function renderStage(force) {
     q.oninput = () => { q.style.height = 'auto'; q.style.height = Math.min(q.scrollHeight, 150) + 'px'; };
     q.onkeydown = e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); } };
     document.getElementById('send').onclick = send;
+    document.getElementById('stop').onclick = stopChat;
+    toggleComposerButtons(S.busy);
     q.focus();
   }
 }
@@ -557,10 +607,12 @@ function renderThread() {
     : botHTML(t)).join('') + (S.busy ? `
       <div class="msg-bot"><span class="dots"><i></i><i></i><i></i></span></div>` : '');
   wireCites(el);
+  toggleComposerButtons(S.busy);
 }
 
 function botHTML(t) {
   const cites = t.citations || [], subs = t.sub_questions || [], sc = t.scores;
+  const trace = t.trace || [];
   const body = t.abstained
     ? `<div class="bot-body abstain">${esc(t.content)}</div>`
     : `<div class="bot-body">${citeify(fmt(t.content))}</div>`;
@@ -584,6 +636,20 @@ function botHTML(t) {
       </div>`).join('')}</div>` : ''}
     ${subs.length > 1 ? `<div class="drawer plan" id="plan-${t.id}" hidden>
       <ul>${subs.map(s => `<li>${esc(s)}</li>`).join('')}</ul></div>` : ''}
+    ${trace.length && S.verbose ? `<div class="trace-panel">
+      <div class="trace-head">🔍 PIPELINE TRACE <span>${trace.length} steps · ${trace[trace.length-1]?.ms || 0} ms total</span></div>
+      <div class="trace-steps">
+        ${trace.map(st => `
+          <div class="trace-step">
+            <span class="trace-label${st.summary.startsWith('GATED') ? ' gate' : ''}">${esc(st.label)}</span>
+            <div style="flex:1;min-width:0">
+              <div class="trace-summary">${esc(st.summary)}</div>
+              ${st.detail ? `<div class="trace-detail">${esc(st.detail)}</div>` : ''}
+            </div>
+            <span class="trace-ms">${st.ms} ms</span>
+          </div>`).join('')}
+      </div>
+    </div>` : ''}
     ${sc ? `<div class="scores">${meter('FAITHFULNESS', sc.faithfulness)}${meter('RELEVANCY', sc.relevancy)}</div>` : ''}
   </div>`;
 }
@@ -618,22 +684,47 @@ async function send() {
 
   q.value = ''; q.style.height = 'auto';
   S.turns.push({ role: 'user', content: text });
-  S.busy = true; renderThread(); scrollThread();
+  S.busy = true; _abort = new AbortController();
+  toggleComposerButtons(true);
+  renderThread(); scrollThread();
 
   try {
     const res = await api(`/sessions/${S.session}/chat`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ query: text, deep_search: S.deep, model: S.model }),
+      body: JSON.stringify({ query: text, deep_search: S.deep, model: S.model, verbose: S.verbose }),
+      signal: _abort.signal,
     });
     S.turns.push({
       id: Date.now(), role: 'assistant', content: res.answer, abstained: res.abstained,
       citations: res.citations, sub_questions: res.sub_questions, scores: res.scores,
+      trace: res.trace || [],
     });
   } catch (e) {
-    S.turns.push({ id: Date.now(), role: 'assistant', content: `Request failed: ${e.message}`, abstained: true });
+    if (e.name === 'AbortError') {
+      S.turns.push({ id: Date.now(), role: 'assistant', content: '⏹ Stopped.', abstained: true, trace: [] });
+    } else {
+      S.turns.push({ id: Date.now(), role: 'assistant', content: `Request failed: ${e.message}`, abstained: true, trace: [] });
+    }
   } finally {
-    S.busy = false; renderThread(); scrollThread(); loadSessions();
+    S.busy = false; _abort = null;
+    toggleComposerButtons(false);
+    renderThread(); scrollThread(); loadSessions();
   }
+}
+
+function toggleComposerButtons(busy) {
+  const send = document.getElementById('send');
+  const stop = document.getElementById('stop');
+  if (send) send.style.display = busy ? 'none' : '';
+  if (stop) stop.style.display = busy ? '' : 'none';
+}
+
+function stopChat() {
+  if (!S.busy || !S.session) return;
+  // Tell the server to cancel between pipeline stages
+  fetch(`/api/sessions/${S.session}/cancel`, { method: 'POST' }).catch(() => {});
+  // Unblock the frontend — the in-flight fetch will throw AbortError
+  if (_abort) _abort.abort();
 }
 
 // ============================================================
@@ -658,6 +749,15 @@ document.getElementById('deep').onclick = e => {
   const b = e.currentTarget;
   b.dataset.on = S.deep ? '1' : '0';
   b.setAttribute('aria-pressed', String(S.deep));
+};
+
+document.getElementById('verbose').onclick = e => {
+  S.verbose = !S.verbose;
+  const b = e.currentTarget;
+  b.dataset.on = S.verbose ? '1' : '0';
+  b.setAttribute('aria-pressed', String(S.verbose));
+  // Re-render to show/hide existing trace panels
+  if (S.session) renderThread();
 };
 
 loadReports().then(renderStage);
