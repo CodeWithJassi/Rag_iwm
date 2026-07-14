@@ -76,11 +76,15 @@ def get_report(report_id: int):
 
 
 @app.post("/api/reports", status_code=202)
-def upload_report(bg: BackgroundTasks, company: str = Form(...), file: UploadFile = File(...)):
+def upload_report(bg: BackgroundTasks, company: str = Form(...),
+                  file: UploadFile = File(...),
+                  extract_tables: str = Form("1"),
+                  ocr_enabled: str = Form("1")):
     """Save the PDF, register the row, return immediately. Ingestion runs behind it.
 
-    Embedding a 40-page report takes tens of seconds on CPU; the browser should
-    not wait for it. The UI polls `status` until it flips to 'ready'.
+    ``extract_tables`` — UI toggle: "1" to extract and enrich tables, "0" to skip.
+    ``ocr_enabled``    — UI toggle: "1" to VLM-transcribe scanned PDFs when normal
+                         text extraction fails, "0" to skip OCR fallback.
     """
     company = company.strip()
     if not company:
@@ -96,7 +100,9 @@ def upload_report(bg: BackgroundTasks, company: str = Form(...), file: UploadFil
         "INSERT INTO reports (company, file_name, file_path) VALUES (%s,%s,%s) RETURNING id",
         (company, file.filename, str(path)))
 
-    bg.add_task(ingest_report, report_id, str(path), company)
+    tables_on = extract_tables.strip() not in ("0", "false", "False", "no")
+    ocr_on = ocr_enabled.strip() not in ("0", "false", "False", "no")
+    bg.add_task(ingest_report, report_id, str(path), company, tables_on, ocr_on)
     return {"id": report_id, "status": "pending"}
 
 
@@ -241,6 +247,33 @@ def get_chunk(chunk_id: int):
     if not c:
         raise HTTPException(404, "Chunk not found")
     return c
+
+
+@app.get("/api/images/{chunk_id}")
+def get_image(chunk_id: int):
+    """Serve the extracted image for an image-type chunk.
+
+    Looks up ``chunks.metadata->>'image_path'``, reads the file from disk, and
+    returns it with the correct MIME type.  404 if the chunk is not an image or
+    the file is missing.
+    """
+    from pathlib import Path
+
+    c = query(
+        "SELECT metadata->>'image_path' AS image_path FROM chunks "
+        "WHERE id=%s AND chunk_type='image'",
+        (chunk_id,), one=True)
+    if not c or not c["image_path"]:
+        raise HTTPException(404, "Image not found for this chunk")
+    path = Path(c["image_path"])
+    if not path.is_file():
+        raise HTTPException(404, "Image file missing on disk")
+    # Guess MIME type from extension.
+    ext = path.suffix.lower()
+    media_type = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg",
+                  "gif": "image/gif", "webp": "image/webp"}.get(ext.lstrip("."),
+                                                                 "image/png")
+    return FileResponse(str(path), media_type=media_type)
 
 
 app.mount("/", StaticFiles(directory=str(STATIC_DIR), html=True), name="static")

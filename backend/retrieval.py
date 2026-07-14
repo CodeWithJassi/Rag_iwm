@@ -184,8 +184,9 @@ def vector_search(report_id: int, text: str = "", *,
     if vec is None:
         vec = embed_query(text)
     return query(
-        """SELECT id, page_no, section, content,
-                  1 - (embedding <=> %s::vector) AS similarity
+        """SELECT id, page_no, section, chunk_type, content,
+                  1 - (embedding <=> %s::vector) AS similarity,
+                  COALESCE((metadata->>'importance')::int, 3) AS importance
              FROM chunks
             WHERE report_id = %s
          ORDER BY embedding <=> %s::vector
@@ -204,8 +205,9 @@ def text_search(report_id: int, text: str, k: int = TOP_K_TEXT) -> list[dict]:
     proper stemming + stop-word removal; we convert its `&` tree to `|` so
     chunks matching *any* query term surface and ts_rank sorts them."""
     return query(
-        """SELECT id, page_no, section, content,
-                  ts_rank(fts, q) AS similarity
+        """SELECT id, page_no, section, chunk_type, content,
+                  ts_rank(fts, q) AS similarity,
+                  COALESCE((metadata->>'importance')::int, 3) AS importance
              FROM chunks,
                   LATERAL (SELECT replace(plainto_tsquery('english', %s)::text,
                                           ' & ', ' | ')::tsquery AS q) tq
@@ -266,18 +268,40 @@ def retrieve_for(sub_question: str, report_id: int, n_rephrasings: int = N_REPHR
     # passages that RRF might have ranked lower.
     fused = rrf_fuse(vec_lists + [text_list], top_n=TOP_N_AFTER_FUSION)
     reranked = rerank(sub_question, fused, top_k=RERANK_TOP_K)
+    # Importance acts as a tiebreaker after reranking.  The reranker's score is
+    # the primary signal; importance only breaks near-ties — a chunk the ingestion
+    # pipeline flagged as highly decision-relevant (cover page thesis, key
+    # financials) surfaces before an equally-relevant disclaimer paragraph.
+    reranked.sort(key=lambda c: (
+        c.get("rerank_score", c.get("similarity", 0)),
+        int(c.get("importance", 3))),
+        reverse=True)
     return reranked, max_sim
 
 
 # ------------------------------------------------------------------ generation
 
 def _render(chunks: list[dict], numbering: dict[int, int]) -> str:
-    """Context block, labelled with each chunk's *global* passage number."""
-    return "\n\n".join(
-        f"[{numbering[c['id']]}] (page {c['page_no']}"
-        + (f", {c['section']}" if c.get("section") else "") + f")\n{c['content']}"
-        for c in chunks
-    )
+    """Context block, labelled with each chunk's *global* passage number.
+
+    For table chunks, a ``[UNITS: ...]`` note is inserted between the header and
+    the content when ``unit_context`` is present in metadata.  This puts the unit
+    declaration directly above the table in the generator's context window —
+    impossible to miss, even for smaller models.
+    """
+    blocks: list[str] = []
+    for c in chunks:
+        header = f"[{numbering[c['id']]}] (page {c['page_no']}"
+        if c.get("section"):
+            header += f", {c['section']}"
+        header += ")"
+        body = c["content"]
+        if c.get("chunk_type") == "table":
+            unit_ctx = (c.get("metadata") or {}).get("unit_context", "")
+            if unit_ctx:
+                header += f"\n[UNITS: {unit_ctx}]"
+        blocks.append(f"{header}\n{body}")
+    return "\n\n".join(blocks)
 
 
 def answer(report: dict, user_query: str, history: list[dict],
@@ -468,7 +492,8 @@ def answer(report: dict, user_query: str, history: list[dict],
     cited_ids = {by_num[n] for n in cited_nums if n in by_num}
     citations = [
         {"n": numbering[c["id"]], "chunk_id": c["id"], "page_no": c["page_no"],
-         "section": c["section"], "similarity": round(float(c["similarity"]), 3),
+         "section": c["section"], "chunk_type": c.get("chunk_type", "text"),
+         "similarity": round(float(c["similarity"]), 3),
          "snippet": c["content"][:280]}
         for c in all_chunks if c["id"] in cited_ids
     ]
@@ -488,7 +513,8 @@ def answer(report: dict, user_query: str, history: list[dict],
         # Include all retrieved chunks as citations since the LLM didn't cite inline.
         citations = [
             {"n": numbering[c["id"]], "chunk_id": c["id"], "page_no": c["page_no"],
-             "section": c["section"], "similarity": round(float(c["similarity"]), 3),
+             "section": c["section"], "chunk_type": c.get("chunk_type", "text"),
+             "similarity": round(float(c["similarity"]), 3),
              "snippet": c["content"][:280]}
             for c in all_chunks
         ]

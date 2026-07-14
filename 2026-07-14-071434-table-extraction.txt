@@ -1,0 +1,920 @@
+ ▐▛███▜▌   Claude Code v2.1.208
+▝▜█████▛▘  deepseek-v4-pro · API Usage Billing
+  ▘▘ ▝▝    /mnt/e/for_ubuntu/claude_dev/rag_project_iwm
+
+
+❯ the problem of use prompt not visible still persist, when there is no active  
+  session of chat the first user message is not visible                         
+
+  Thought for 3s (ctrl+o to expand)
+
+● Let me look at the frontend code to understand the chat UI and find why the
+  first message isn't visible when there's no active session.
+
+  Thought for 1m 13s, read 1 file (ctrl+o to expand)
+
+● I can see the bug. Let me trace through the send() flow when there's no active
+  session:
+
+  Thought for 3s, read 1 file (ctrl+o to expand)
+
+● Found it. The bug is on line 492 of static/index.html:
+
+  selectSession(id);  // selectSession calls loadSessions() internally
+
+  selectSession(id) is called without await inside newSession(). Here's the race
+  condition:
+
+  1. User types a message and hits Enter → send() runs
+  2. S.session is null, so send() calls await newSession()
+  3. newSession() creates the session via API, then calls selectSession(id)
+  without await and returns immediately
+  4. send() resumes while selectSession() is still running its async work in the
+  background
+  5. send() pushes the user message to S.turns, calls renderThread() — the
+  message appears briefly
+  6. The floating selectSession() promise eventually resolves: S.turns = await 
+  api(...) returns [] for the new session, overwriting the user message that was
+  just pushed
+  7. selectSession() then calls renderStage('chat') which recreates the entire
+  DOM, destroying the thread that had the user message
+
+  The fix is a one-word change — add await:
+
+● Update(static/index.html)
+  ⎿  Added 1 line, removed 1 line
+      489  async function newSession() {
+      490    if (!S.report || S.report.status !== 'ready') return;
+      491    const { id } = await api(`/reports/${S.report.id}/sessions`,
+            { method: 'POST' });
+      492 -  selectSession(id);  // selectSession calls loadSessions() in
+          -ternally                                                      
+      492 +  await selectSession(id);  // must await: otherwise the float
+          +ing promise overwrites S.turns mid-send()                     
+      493  }
+      494  async function dropSession(id) {
+      495    await api(`/sessions/${id}`, { method: 'DELETE' });
+
+  Thought for 6s (ctrl+o to expand)
+
+● The fix is a single word: await. Here's what was happening:
+
+  Root cause: newSession() at line 492 called selectSession(id) without await,
+  so it returned a floating promise. newSession() resolved immediately, and
+  send() continued executing while selectSession() was still running in the
+  background. When selectSession() finally completed, it executed S.turns = 
+  await api(...) (returning [] for the empty new session), which overwrote the
+  user message that send() had already pushed to S.turns. Then
+  renderStage('chat') inside selectSession recreated the entire DOM, destroying
+  the thread that briefly showed the user message.
+
+  The race:
+  1. send() pushes user message to S.turns → renders it
+  2. Floating selectSession() completes → sets S.turns = [] → calls
+  renderStage('chat') → DOM rebuilt, message gone
+
+  With await selectSession(id), the sequence is now deterministic: selectSession
+  fully completes (including renderStage recreating the DOM) before send()
+  resumes, sets the textarea value, and recursively calls itself to push the
+  message and render it.
+
+✻ Worked for 1m 38s
+
+※ recap: Fixing a UI bug where the first chat message vanished when no session existed. Applied a one-word fix (adding `await` to `selectSession` in `newSession()`). Next: verify the fix works by testing in the browser. (disable recaps in /config)
+
+❯ INFO:     127.0.0.1:60616 - "GET / HTTP/1.1" 200 OK                           
+  INFO:     127.0.0.1:60616 - "GET /api/reports HTTP/1.1" 200 OK                
+  INFO:     127.0.0.1:55966 - "GET /api/models HTTP/1.1" 200 OK                 
+  2026-07-14 05:40:57,752 INFO llm | [sub_answer] success via                   
+  Ollama(llama3.1:8b) (cycle 1)                                                 
+  ERROR:    Exception in ASGI application                                       
+  Traceback (most recent call last):                                            
+    File "/mnt/e/for_ubuntu/claude_dev/rag_project_iwm/venv/lib/python3.12/site 
+  -packages/uvicorn/protocols/http/httptools_impl.py", line 409, in run_asgi    
+      result = await app(  # type: ignore[func-returns-value]                   
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^                   
+    File "/mnt/e/for_ubuntu/claude_dev/rag_project_iwm/venv/lib/python3.12/site 
+  -packages/uvicorn/middleware/proxy_headers.py", line 60, in __call__          
+      return await self.app(scope, receive, send)                               
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^                               
+    File "/mnt/e/for_ubuntu/claude_dev/rag_project_iwm/venv/lib/python3.12/site 
+  -packages/fastapi/applications.py", line 1054, in __call__                    
+      await super().__call__(scope, receive, send)                              
+    File "/mnt/e/for_ubuntu/claude_dev/rag_project_iwm/venv/lib/python3.12/site 
+  -packages/starlette/applications.py", line 113, in __call__                   
+      await self.middleware_stack(scope, receive, send)                         
+    File "/mnt/e/for_ubuntu/claude_dev/rag_project_iwm/venv/lib/python3.12/site 
+  -packages/starlette/middleware/errors.py", line 187, in __call__              
+      raise exc                                                                 
+    File "/mnt/e/for_ubuntu/claude_dev/rag_project_iwm/venv/lib/python3.12/site 
+  -packages/starlette/middleware/errors.py", line 165, in __call__              
+      await self.app(scope, receive, _send)                                     
+    File "/mnt/e/for_ubuntu/claude_dev/rag_project_iwm/venv/lib/python3.12/site 
+  -packages/starlette/middleware/exceptions.py", line 62, in __call__           
+      await wrap_app_handling_exceptions(self.app, conn)(scope, receive, send)  
+    File "/mnt/e/for_ubuntu/claude_dev/rag_project_iwm/venv/lib/python3.12/site 
+  -packages/starlette/_exception_handler.py", line 53, in wrapped_app           
+      raise exc                                                                 
+    File "/mnt/e/for_ubuntu/claude_dev/rag_project_iwm/venv/lib/python3.12/site 
+  -packages/starlette/_exception_handler.py", line 42, in wrapped_app           
+      await app(scope, receive, sender)                                         
+    File "/mnt/e/for_ubuntu/claude_dev/rag_project_iwm/venv/lib/python3.12/site 
+  -packages/starlette/routing.py", line 715, in __call__                        
+      await self.middleware_stack(scope, receive, send)                         
+    File "/mnt/e/for_ubuntu/claude_dev/rag_project_iwm/venv/lib/python3.12/site 
+  -packages/starlette/routing.py", line 735, in app                             
+      await route.handle(scope, receive, send)                                  
+    File "/mnt/e/for_ubuntu/claude_dev/rag_project_iwm/venv/lib/python3.12/site 
+  -packages/starlette/routing.py", line 288, in handle                          
+      await self.app(scope, receive, send)                                      
+    File "/mnt/e/for_ubuntu/claude_dev/rag_project_iwm/venv/lib/python3.12/site 
+  -packages/starlette/routing.py", line 76, in app                              
+      await wrap_app_handling_exceptions(app, request)(scope, receive, send)    
+    File "/mnt/e/for_ubuntu/claude_dev/rag_project_iwm/venv/lib/python3.12/site 
+  -packages/starlette/_exception_handler.py", line 53, in wrapped_app           
+      raise exc                                                                 
+    File "/mnt/e/for_ubuntu/claude_dev/rag_project_iwm/venv/lib/python3.12/site 
+  -packages/starlette/_exception_handler.py", line 42, in wrapped_app           
+      await app(scope, receive, sender)                                         
+    File "/mnt/e/for_ubuntu/claude_dev/rag_project_iwm/venv/lib/python3.12/site 
+  -packages/starlette/routing.py", line 73, in app                              
+      response = await f(request)                                               
+                 ^^^^^^^^^^^^^^^^                                               
+    File "/mnt/e/for_ubuntu/claude_dev/rag_project_iwm/venv/lib/python3.12/site 
+  -packages/fastapi/routing.py", line 301, in app                               
+      raw_response = await run_endpoint_function(                               
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^                               
+    File "/mnt/e/for_ubuntu/claude_dev/rag_project_iwm/venv/lib/python3.12/site 
+  -packages/fastapi/routing.py", line 214, in run_endpoint_function             
+      return await run_in_threadpool(dependant.call, **values)                  
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^                  
+    File "/mnt/e/for_ubuntu/claude_dev/rag_project_iwm/venv/lib/python3.12/site 
+  -packages/starlette/concurrency.py", line 39, in run_in_threadpool            
+      return await anyio.to_thread.run_sync(func, *args)                        
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^                        
+    File "/mnt/e/for_ubuntu/claude_dev/rag_project_iwm/venv/lib/python3.12/site 
+  -packages/anyio/to_thread.py", line 63, in run_sync                           
+      return await get_async_backend().run_sync_in_worker_thread(               
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^               
+    File "/mnt/e/for_ubuntu/claude_dev/rag_project_iwm/venv/lib/python3.12/site 
+  -packages/anyio/_backends/_asyncio.py", line 2596, in                         
+  run_sync_in_worker_thread                                                     
+      return await future                                                       
+             ^^^^^^^^^^^^                                                       
+    File "/mnt/e/for_ubuntu/claude_dev/rag_project_iwm/venv/lib/python3.12/site 
+  -packages/anyio/_backends/_asyncio.py", line 1029, in run                     
+      result = context.run(func, *args)                                         
+               ^^^^^^^^^^^^^^^^^^^^^^^^                                         
+    File "/mnt/e/for_ubuntu/claude_dev/rag_project_iwm/backend/main.py", line   
+  201, in chat                                                                  
+      memory.add_turn(session_id, "assistant", result["answer"],                
+    File "/mnt/e/for_ubuntu/claude_dev/rag_project_iwm/backend/memory.py", line 
+  55, in add_turn                                                               
+      return execute(                                                           
+             ^^^^^^^^                                                           
+    File "/mnt/e/for_ubuntu/claude_dev/rag_project_iwm/backend/db.py", line     
+  198, in execute                                                               
+      cur = conn.execute(sql, params)                                           
+            ^^^^^^^^^^^^^^^^^^^^^^^^^                                           
+    File "/mnt/e/for_ubuntu/claude_dev/rag_project_iwm/venv/lib/python3.12/site 
+  -packages/psycopg/connection.py", line 251, in execute                        
+      raise ex.with_traceback(None)                                             
+  psycopg.errors.ForeignKeyViolation: insert or update on table "turns"         
+  violates foreign key constraint "turns_session_id_fkey"                       
+  DETAIL:  Key (session_id)=(153) is not present in table "sessions".           
+  INFO:     127.0.0.1:35860 - "GET / HTTP/1.1" 304 Not Modified                 
+  INFO:     127.0.0.1:35858 - "GET /api/models HTTP/1.1" 200 OK                 
+  INFO:     127.0.0.1:35860 - "GET /api/reports HTTP/1.1" 200 OK what is this   
+  error                                                                         
+
+  Thought for 11s (ctrl+o to expand)
+
+● This is a foreign key violation — the backend is trying to insert a chat turn
+  for session 153, but that session doesn't exist in the sessions table. Let me
+  look at the relevant backend code to understand why.
+
+  Thought for 2m 54s, read 3 files (ctrl+o to expand)
+
+● This error is a foreign key violation on the backend — the chat endpoint is
+  trying to save the assistant's response to session 153, but session 153 no
+  longer exists in the sessions table. Let me trace through the chat endpoint to
+  understand how this happens:
+
+  Thought for 17s, read 1 file (ctrl+o to expand)
+
+● Now I can see the full chain of events. Here's what's happening:
+
+  The FK violation: The chat endpoint checks that session 153 exists at line 156
+  (it does), inserts the user turn at line 168 (succeeds), then runs the LLM
+  pipeline (takes seconds). During those seconds, session 153 gets deleted — so
+  when line 201 tries to insert the assistant turn, Postgres rejects it because
+  the foreign key target is gone.
+
+  The root cause is the same frontend race condition we just fixed. With the old
+  code, selectSession() ran as a floating promise — it could fire
+  renderStage('chat') (which recreates the DOM and calls loadSessions()) at any
+  point during the chat request, potentially triggering state changes that led
+  to the session being cleaned up.
+
+  But the backend should also be resilient to this. Let me fix both ends:
+
+  Thought for 3s, read 1 file (ctrl+o to expand)
+
+● Update(backend/main.py)
+  ⎿  Added 12 lines, removed 5 lines
+      198          scores = judge.validate(result["standalone"], result["
+           context"],
+      199                                  result["answer"], model=req.mo
+           del)
+      200  
+      201 -    memory.add_turn(session_id, "assistant", result["answer"],
+      202 -                    standalone=result["standalone"],          
+      203 -                    sub_questions=result["sub_questions"],    
+      204 -                    citations=result["citations"],            
+      205 -                    scores=scores, abstained=result["abstained
+          -"])                                                           
+      201 +    try:                                                      
+      202 +        memory.add_turn(session_id, "assistant", result["answe
+          +r"],                                                          
+      203 +                        standalone=result["standalone"],      
+      204 +                        sub_questions=result["sub_questions"],
+      205 +                        citations=result["citations"],        
+      206 +                        scores=scores, abstained=result["absta
+          +ined"])                                                       
+      207 +    except Exception:                                         
+      208 +        # Session may have been deleted while the pipeline was
+          + running                                                      
+      209 +        # (user clicked × in another tab, or the old frontend 
+          +race condition).                                              
+      210 +        # The answer is still returned to the caller — we just
+          + can't persist it.                                            
+      211 +        logger.warning("session %d deleted during pipeline — a
+          +ssistant turn not saved",                                     
+      212 +                       session_id)                            
+      213  
+      214      return {"answer": result["answer"], "abstained": result["a
+           bstained"],
+      215              "reason": result["reason"], "standalone": result["
+           standalone"],
+
+  Thought for 2s (ctrl+o to expand)
+
+● Now let me verify both fixes are in place:
+
+  Thought for 4s, searched for 1 pattern, ran 2 shell commands (ctrl+o to expand)
+
+● Both fixes are in place. Here's the summary:
+
+  ---
+  What that error was
+
+  Key (session_id)=(153) is not present in table "sessions".
+
+  The sequence: The chat endpoint verified session 153 existed (line 156),
+  inserted the user turn (line 168), then spent several seconds running the LLM
+  pipeline. During those seconds, session 153 was deleted. When it tried to
+  insert the assistant turn (line 201), Postgres rejected it — the parent row
+  was gone.
+
+  Two fixes applied
+
+  1. Frontend race condition (root cause) — static/index.html:492
+
+  newSession() called selectSession(id) without await. That floating promise
+  would eventually execute S.turns = [] (overwriting the user message) and
+  renderStage('chat') (recreating the DOM). This caused both:
+  - "First message not visible" — the floating selectSession wiped S.turns after
+  send() had pushed the user message
+  - FK violation — the DOM churn from the floating renderStage could trigger
+  state changes that led to the session being cleaned up mid-request
+
+  Fix: Added await so selectSession completes fully before send() continues.
+
+  2. Backend resilience — main.py:201
+
+  Even with the frontend fixed, a session could legitimately be deleted
+  mid-request (e.g., two browser tabs). The backend now catches the FK
+  violation, logs a warning, and still returns the answer to the caller — rather
+  than crashing with a 500.
+
+  ---
+  Important: You need to hard-refresh your browser (Ctrl+Shift+R) to load the
+  updated index.html. Static files are often cached, so a normal refresh may
+  still serve the old (buggy) code.
+
+  Thought for 3s, ran 1 shell command (ctrl+o to expand)
+
+● The diff shows all the changes in context. There are three meaningful changes
+  here (the .claude/settings.local.json and .env.example diffs are
+  pre-existing):
+
+  1. static/index.html:492 — await selectSession(id) — the root cause fix
+  2. static/index.html:695-708 — send() now preserves the query text across the
+  DOM rebuild that selectSession → renderStage triggers, and restores it into
+  the new textarea before the recursive call
+  3. backend/main.py:201-210 — backend now catches the FK violation gracefully
+  instead of crashing with a 500
+
+  Hard-refresh (Ctrl+Shift+R) and the first-message bug should be gone.
+
+✻ Churned for 4m 8s
+
+※ recap: Fixed the missing first-message bug by awaiting session creation in the frontend and making the backend resilient to mid-request session deletion. Hard-refresh your browser (Ctrl+Shift+R) to pick up the updated static file. (disable recaps in /config)
+
+❯ now i want to upgrade the injestion pipeline by adding the feastues of table  
+  and image extraction(may conatin handwritten or pie chart, graph etc), tell   
+  me plan how can we impliment that, just plan no coding yet                    
+
+  Thought for 3s (ctrl+o to expand)
+
+● Let me first understand the current extraction pipeline and the existing
+  stubs.
+
+  Thought for 1m 1s, read 8 files (ctrl+o to expand)
+
+● Now let me check what dependencies are already available for table/image work:
+
+  Thought for 8s, read 1 file, ran 2 shell commands (ctrl+o to expand)
+
+● Good. I now have a complete picture of the system. Here's the plan.
+
+  ---
+  Plan: Table & Image Extraction for Ingestion Pipeline
+
+  What already works in our favor
+
+  The schema and pipeline already carry chunk_type — it's just hardcoded to
+  "text" everywhere. Adding tables and images means producing chunks with
+  different chunk_type values; retrieval, embedding, citation, and the UI all
+  pass them through unchanged. No pipeline refactor needed.
+
+  The stubs at the bottom of extract.py already outline the approach. This plan
+  fills in the details.
+
+  ---
+  Phase 1 — Table Extraction
+
+  The problem
+
+  Broker reports put critical data in tables: quarterly P&L, valuation
+  multiples, peer comparisons, segment revenue splits. When tables are embedded
+  in prose chunks via pymupdf4llm's markdown, the embedding model sees a wall of
+  pipe characters — it can't "read" a table the way an analyst scans rows and
+  columns. Dedicated chunk_type: "table" chunks with clean markdown tables let
+  the retriever surface exact figures.
+
+  Step 1.1: extract.py — extract tables from PDF
+
+  Two sources, combined with deduplication:
+
+  Source A — pdfplumber .extract_tables() (already a dependency):
+  - Call page.extract_tables() on every page
+  - Each table is a list[list[str | None]] — serialize to GitHub-flavored
+  markdown (| col | col |)
+  - Tag with page_no
+
+  Source B — parse markdown tables from pymupdf4llm output:
+  - pymupdf4llm already renders many tables as markdown in the page text
+  - Scan each page for markdown table blocks (lines starting/ending with |)
+  - Extract them as separate table entries
+
+  Deduplication: A pdfplumber table and a pymupdf4llm markdown table on the same
+  page with overlapping content should merge. Simple heuristic: if two tables
+  on the same page share >50% of their numeric cells, keep only the cleaner one
+  (prefer pdfplumber — it preserves cell alignment).
+
+  Fallback: If neither source produces tables, that's fine — many pages have
+  none.
+
+  New function: extract_tables(path) -> list[dict] where each dict is
+  {"page_no": int, "content": str (markdown table), "source": "pdfplumber" | 
+  "pymupdf4llm"}.
+
+  Step 1.2: chunking.py — convert tables to chunks
+
+  table_chunks(tables: list[dict]) -> list[dict]:
+  - Large markdown tables (over RETRIEVAL_CHUNK_CHARS) get split into sub-tables
+  (keep the header row, split body rows)
+  - Very small tables (<50 chars, like a 2×2) get dropped — they're probably
+  page-number artifacts
+  - Each chunk gets chunk_type: "table", page_no, section (from nearest heading
+  on that page)
+  - A prefix labels the chunk for embedding: "[TABLE] Page {n}" — helps the
+  embedding model understand this is structured data, not prose
+
+  Step 1.3: ingest.py — wire into the parallel pipeline
+
+  Currently three parallel tasks: summarize_report, extract_facts,
+  retrieval_chunks. Tables add a fourth:
+  with ThreadPoolExecutor(max_workers=3) as ex:   # bump to 4
+      fut_summary  = ex.submit(summarize_report, text, company)
+      fut_facts    = ex.submit(extract_facts, text, company)
+      fut_chunks   = ex.submit(retrieval_chunks, pages)
+      fut_tables   = ex.submit(table_chunks, extract_tables(pdf_path))  # NEW
+
+  Table chunks are merged into the chunks list before embedding. Order: text
+  chunks first, then table chunks (preserves ord ordering).
+
+  Step 1.4: config.py — new knobs
+
+  TABLE_EXTRACTION_ENABLED = True   # toggle for environments without pdfplumber
+  TABLE_MAX_CHARS = 2100            # max chars per table chunk (matches text)
+
+  ---
+  Phase 2 — Image Extraction
+
+  The problem
+
+  Broker reports contain charts (price targets, valuation bridges), graphs
+  (revenue trajectories), pie charts (segment mix), and occasionally handwritten
+  annotations. These contain information that is never present in the text — a
+  revenue trajectory chart says more than "revenue grew 12%."
+
+  Step 2.1: extract.py — extract images from PDF
+
+  Use PyMuPDF (pymupdf):
+  - page.get_images(full=True) returns a list of image metadata (xref, width,
+  height, bbox, etc.)
+  - Filter: skip images smaller than IMAGE_MIN_SIZE (default 150×150 px) —
+  eliminates logos, bullet icons, 1px spacers
+  - Extract each qualifying image: doc.extract_image(xref) → raw bytes + format
+  (png/jpeg)
+  - Save to data/images/{report_id}/img_{page_no}_{index}.{ext}
+  - Also render the full page as an image when needed (for charts that are drawn
+  as vector graphics rather than embedded raster images — PyMuPDF can render a
+  page to a pixmap)
+
+  Vector chart detection: Some PDFs draw charts as vector paths, not embedded
+  images. page.get_images() returns nothing for these. Heuristic: if a page has
+  very low text density (<200 chars per extract_pages()) but is not blank, it
+  likely contains a chart or graph. Render these pages as high-res pixmaps.
+
+  New function: extract_images(pdf_path, report_id) -> list[dict] where each
+  dict is {"page_no": int, "image_path": str, "bbox": (x0,y0,x1,y1) | None, 
+  "is_page_render": bool}.
+
+  Step 2.2: llm.py — vision model support
+
+  Add llm_vision(image_path: str, prompt: str, model: str = "") -> str | None:
+
+  Ollama's chat API accepts base64-encoded images:
+  import base64
+  resp = requests.post(f"{LLM_BASE_URL}/api/chat", json={
+      "model": vision_model,
+      "messages": [{
+          "role": "user",
+          "content": prompt,
+          "images": [base64.b64encode(open(path,'rb').read()).decode()]
+      }],
+      "stream": False,
+      "options": {"temperature": 0.1, "num_predict": 200}
+  })
+
+  Follow the same failover pattern as llm_complete() — try vision-capable Ollama
+  models first, then paid vision APIs (GPT-4o, Gemini) if configured.
+
+  Step 2.3: extract.py — caption images
+
+  caption_images(images: list[dict], company: str, model: str = "") -> 
+  list[dict]:
+
+  For each extracted image, call the vision model with a structured prompt:
+  You are analyzing a chart, graph, or image from an equity research report on
+  {company}.
+  Describe what you see in detail. Include:
+  - Type of visual (bar chart, line graph, pie chart, table screenshot,
+  handwritten note, diagram)
+  - All numbers, labels, and axis titles visible
+  - The key trend, comparison, or insight the visual conveys
+  - Any annotations, callouts, or handwritten marks
+  Be specific and factual. Do not guess values you cannot read.
+
+  The caption becomes the chunk content. This is what gets embedded and
+  retrieved.
+
+  Performance concern: A 40-page report might have 20+ images. Each vision LLM
+  call takes 5–30 seconds. Run captions in parallel with ThreadPoolExecutor (cap
+  at 3 concurrent to avoid GPU OOM). This adds 2–5 minutes to ingestion for
+  image-heavy reports. A config toggle (VISION_ENABLED) lets operators turn this
+  off.
+
+  Step 2.4: chunking.py — image chunks
+
+  image_chunks(images: list[dict], captions: list[str]) -> list[dict]:
+
+  - Each captioned image becomes one chunk
+  - chunk_type: "image"
+  - content: the caption text (this is what gets embedded)
+  - The image path goes into a new metadata JSONB column on the chunks table
+  - Very short captions (<30 chars, e.g., "A logo") get dropped
+
+  Step 2.5: db.py — schema migration
+
+  Add a JSONB metadata column to chunks (zero-downtime migration):
+  ALTER TABLE chunks ADD COLUMN IF NOT EXISTS metadata JSONB;
+
+  Image chunks store {"image_path": "...", "is_page_render": true/false}.
+  Table chunks store {"table_source": "pdfplumber", "rows": N, "cols": M}.
+  Future extensions (audio, video) get their own metadata keys without another
+  migration.
+
+  Step 2.6: ingest.py — wire images into the pipeline
+
+  The parallel block grows again:
+  tasks:
+    1. summarize_report(text, company)
+    2. extract_facts(text, company)
+    3. retrieval_chunks(pages)
+    4. extract_tables(pdf_path) → table_chunks()
+    5. extract_images(pdf_path, report_id) → caption_images() → image_chunks()
+
+  Tasks 4 and 5 are sequential internally (extract → chunk) but parallel with
+  1–3. The image captioning step (vision LLM calls) will dominate wall-clock
+  time, but it runs concurrently with summarization (which also makes LLM
+  calls).
+
+  All chunk types merge into one list before embedding and insertion.
+
+  Step 2.7: config.py — image knobs
+
+  VISION_ENABLED = False           # requires pulling a vision model; opt-in
+  VISION_MODEL = "llava:13b"       # or gemma3:12b, minicpm-v, gpt-4o
+  IMAGE_MIN_SIZE = 150             # pixels — skip anything smaller
+  IMAGE_CAPTION_CONCURRENCY = 3    # parallel vision LLM calls
+  IMAGE_CAPTION_MAX_TOKENS = 200   # captions should be concise
+
+  ---
+  Phase 3 — UI Updates (minimal, incremental)
+
+  These are independent and can ship after phases 1–2:
+
+  Source drawer — table rendering
+
+  When a citation's chunk has chunk_type: "table", render the markdown table as
+  an HTML <table> instead of a plain-text snippet. Simple: parse the | col | col
+  | lines into <tr>/<td> elements. The source drawer already has the chunk
+  content available.
+
+  Source drawer — image thumbnails
+
+  When chunk_type: "image", show a small thumbnail alongside the caption text.
+  Needs a new API endpoint: GET /api/images/{chunk_id} → serves the image file
+  from data/images/. The image path is in chunks.metadata.
+
+  Chat body — image citation pills
+
+  Image citations in the answer could have a distinct pill style (e.g., "📊
+  Source" instead of just the page number). Small CSS change.
+
+  ---
+  What does NOT change
+
+  ┌────────────────┬────────────────────────────────────────────────────────┐
+  │   Component    │                     Why untouched                      │
+  ├────────────────┼────────────────────────────────────────────────────────┤
+  │ retrieval.py   │ Already queries all chunk_types together;              │
+  │                │ gate/rerank/fuse/synthesize are type-agnostic          │
+  ├────────────────┼────────────────────────────────────────────────────────┤
+  │ embeddings.py  │ Table markdown and image captions are text — same      │
+  │                │ embedding model, same API                              │
+  ├────────────────┼────────────────────────────────────────────────────────┤
+  │ summarize.py   │ Summary reads full_text(pages) — tables in prose are   │
+  │                │ already there from pymupdf4llm                         │
+  ├────────────────┼────────────────────────────────────────────────────────┤
+  │ judge.py       │ Validates against context regardless of chunk_type     │
+  ├────────────────┼────────────────────────────────────────────────────────┤
+  │ memory.py      │ Unaware of chunk structure                             │
+  ├────────────────┼────────────────────────────────────────────────────────┤
+  │ Prompt         │ All prompts already say "passages" / "context" — not   │
+  │ templates      │ "text chunks"                                          │
+  └────────────────┴────────────────────────────────────────────────────────┘
+
+  ---
+  Risk: duplication between text chunks and table chunks
+
+  When pymupdf4llm renders a table as markdown, the same data appears in both:
+  - A text chunk containing the paragraph around the table (with the markdown
+  table inline)
+  - A dedicated table chunk
+
+  This isn't harmful — RRF fusion treats them as independent chunks, and having
+  the same fact retrievable through both a prose query ("what was Q3 revenue?")
+  and a structured query ("show me the quarterly P&L") is a feature. The
+  embedding model reads both forms differently.
+
+  If duplication becomes noisy in results, we can add a post-hoc dedup step:
+  strip markdown tables from text chunks before embedding. Deferred until it
+  proves to be a real problem.
+
+  ---
+  Order of implementation
+
+  1. Phase 1 (tables) — lower risk, no new model needed, immediate value
+  2. Phase 2 (images) — requires pulling a vision model, more complexity
+  3. Phase 3 (UI) — polish, can ship incrementally
+
+  Each phase is independently shippable. Tables can go to production without
+  images, and vice versa — the pipeline handles chunk_type agnostically, so
+  partial coverage works fine.
+
+  ---
+  That's the plan. Want me to proceed with Phase 1 (tables), or would you like
+  to adjust any of the design decisions first?
+✻ Cooked for 2m 12s
+
+※ recap: We fixed the first-message-not-visible bug and a backend crash, then you asked for a plan to add table and image extraction to ingestion. I delivered the full plan covering both phases. Ready to start implementing Phase 1 (tables) when you are. (disable recaps in /config)
+
+❯ lets add table but with the toggle option if we want it or not, also adding   
+  some meta data to those chunks like questions that can be asked from that     
+  table, general questions like how many students comes to school on saturday,  
+  for table with cols as days of the week, row as different stats, frequency,   
+  class etc. if you have some oter idea to make retrival more richer with       
+  richer chunking and injestion, suggest them                                   
+
+  Thought for 31s (ctrl+o to expand)
+
+● Good idea — generating questions from tables bridges the gap between
+  structured table data and natural-language queries. Let me refine the table
+  plan with this enrichment approach, then suggest other ideas for richer
+  ingestion.
+
+  ---
+  Refined Plan: Table Extraction with Enrichment
+
+  The core insight
+
+  Markdown tables and natural-language queries live in different embedding
+  neighborhoods. A user asking "what was Q3 EBITDA margin?" and a markdown table
+  of | Q1 | Q2 | Q3 | Q4 | with numbers underneath produce very different
+  vectors, even though the table contains the answer.
+
+  Fix: At ingest time, enrich each table chunk with LLM-generated content that
+  looks like the queries analysts will actually type. The enriched text is
+  embedded; the clean table is stored for display.
+
+  ---
+  Step 1 — Extract tables from PDF
+
+  Same as before. Two sources:
+
+  ┌─────────────┬────────────────────────────────┬──────────────────────────┐
+  │   Source    │             Method             │         Strength         │
+  ├─────────────┼────────────────────────────────┼──────────────────────────┤
+  │             │ page.extract_tables() →        │ Preserves cell           │
+  │ pdfplumber  │ serialize to markdown          │ alignment, handles       │
+  │             │                                │ merged cells             │
+  ├─────────────┼────────────────────────────────┼──────────────────────────┤
+  │ pymupdf4llm │ Parse | markdown table blocks  │ Already available in     │
+  │             │ from page text                 │ existing output          │
+  └─────────────┴────────────────────────────────┴──────────────────────────┘
+
+  Deduplicate: if both sources produce a table on the same page with >50%
+  overlapping numeric cells, keep the pdfplumber version (cleaner structure).
+
+  New in extract.py: extract_tables(pdf_path) -> list[dict]
+  Returns {"page_no": int, "markdown": str, "source": str, "rows": int, "cols": 
+  int}.
+
+  ---
+  Step 2 — Enrich each table with an LLM call
+
+  This is the key step. For each extracted table, make one LLM call that
+  produces three things:
+
+  You are analyzing a table from an equity research report on {company}.
+
+  TABLE (markdown):
+  {markdown}
+
+  Return a JSON object with three fields:
+
+  1. "questions": 3-5 natural-language questions an analyst might ask that this
+     table answers. Make them specific — include the numbers, time periods, and
+     entity names visible in the table. Write them the way an analyst would
+     actually type them into a search box. Vary the phrasing.
+
+  2. "summary": One sentence describing what this table shows. Include the key
+     takeaway — direction, magnitude, and time period.
+
+  3. "key_metrics": A list of the most important facts from this table, each as
+     "label: value". Pull the most decision-relevant numbers (totals, growth
+     rates, margins, extremes). Max 8.
+
+  Respond with ONLY a JSON object, no prose, no markdown fences.
+
+  Example output for a quarterly P&L table:
+  {
+    "questions": [
+      "What was Thyrocare's revenue in Q3 FY24?",
+      "How much did EBITDA grow from Q2 to Q3 FY24?",
+      "What was the PAT margin in the December quarter?",
+      "Show me the quarterly revenue and EBITDA trend for Thyrocare"
+    ],
+    "summary": "Thyrocare's quarterly P&L shows revenue growing 12% QoQ to 
+  ₹450cr in Q3 FY24 with EBITDA margins expanding 180bps.",
+    "key_metrics": [
+      "Q3 FY24 Revenue: ₹450cr",
+      "Q3 FY24 EBITDA: ₹120cr",
+      "Q3 FY24 PAT: ₹85cr",
+      "QoQ revenue growth: 12%",
+      "EBITDA margin: 26.7%"
+    ]
+  }
+
+  What gets stored vs. what gets embedded:
+
+  ┌─────────────┬───────────────────┬─────────────────┬────────────────────┐
+  │    What     │    Stored in      │ Used at embed   │     Stored in      │
+  │             │  chunks.content   │      time       │  chunks.metadata   │
+  ├─────────────┼───────────────────┼─────────────────┼────────────────────┤
+  │ Raw         │ ✅ (clean, for UI │                 │                    │
+  │ markdown    │  display)         │ —               │ —                  │
+  │ table       │                   │                 │                    │
+  ├─────────────┼───────────────────┼─────────────────┼────────────────────┤
+  │ Questions   │ —                 │ ✅ (prepended   │ ✅                 │
+  │             │                   │ for embedding)  │                    │
+  ├─────────────┼───────────────────┼─────────────────┼────────────────────┤
+  │ Summary     │ —                 │ ✅ (prepended   │ ✅                 │
+  │             │                   │ for embedding)  │                    │
+  ├─────────────┼───────────────────┼─────────────────┼────────────────────┤
+  │ Key metrics │ —                 │ ✅ (prepended   │ ✅                 │
+  │             │                   │ for embedding)  │                    │
+  ├─────────────┼───────────────────┼─────────────────┼────────────────────┤
+  │ Rows × cols │ —                 │ —               │ ✅                 │
+  └─────────────┴───────────────────┴─────────────────┴────────────────────┘
+
+  The embedding-time text becomes:
+  [TABLE: Thyrocare — Quarterly Financials]
+  SUMMARY: Thyrocare's quarterly P&L shows revenue growing 12% QoQ to ₹450cr...
+  QUESTIONS: What was Thyrocare's revenue in Q3 FY24? | How much did EBITDA
+  grow...
+  KEY FACTS: Q3 FY24 Revenue: ₹450cr | Q3 FY24 EBITDA: ₹120cr | ...
+  TABLE:
+  | Quarter | Revenue | EBITDA | PAT |
+  |---|---|---|---|
+  | ... |
+
+  This enriched text is in the same embedding space as analyst queries. A vector
+  search for "what was the EBITDA margin last quarter" will hit the QUESTIONS
+  and KEY FACTS sections even though those exact words aren't in the raw table.
+
+  Performance: One LLM call per table. A report with 8 tables = 8 extra LLM
+  calls during ingestion. With TABLE_ENRICH_CONCURRENCY = 4, this adds ~10–15
+  seconds total (tables run in parallel with summarization, which is already
+  30–60s — so wall-clock impact is near zero).
+
+  ---
+  Step 3 — Convert to chunks
+
+  table_chunks(tables, enrichments) -> list[dict]:
+  - Large tables (>2100 chars of markdown) split with header row repeated
+  - Each chunk carries chunk_type: "table", page_no, section
+  - The embedding-time prefix is built from the enrichment data (not stored in
+  content)
+
+  ---
+  Step 4 — Schema migration
+
+  ALTER TABLE chunks ADD COLUMN IF NOT EXISTS metadata JSONB;
+
+  For table chunks: {"questions": [...], "summary": "...", "key_metrics": [...],
+  "rows": 12, "cols": 5, "source": "pdfplumber"}.
+
+  For text chunks: null (or {}) — no overhead for existing data.
+
+  ---
+  Step 5 — Config knobs
+
+  TABLE_EXTRACTION_ENABLED = True     # master toggle
+  TABLE_ENRICH_ENABLED = True         # toggle the LLM enrichment step 
+  specifically
+  TABLE_ENRICH_CONCURRENCY = 4        # parallel enrichment calls
+  TABLE_MAX_CHARS = 2100              # max chars per table chunk
+  TABLE_MIN_ROWS = 2                  # skip single-row "tables" (page 
+  artifacts)
+
+  Two toggles because extraction (pdfplumber → markdown) is cheap and always
+  worth doing, but enrichment (LLM calls) costs GPU time and might be turned off
+  for bulk re-ingestion.
+
+  ---
+  Step 6 — Wire into ingest.py
+
+  The parallel block becomes:
+  extract → parallel(
+      summarize_report(text, company),          # LLM: 30-60s
+      extract_facts(text, company),              # LLM: ~2s (first 6000 chars)
+      retrieval_chunks(pages),                   # CPU: ~1s
+      extract_tables(path) → enrich_tables() → table_chunks(),  # LLM: ~10-15s
+  )
+
+  All four run concurrently. Tables piggyback on the summarization's GPU time
+  for free.
+
+  ---
+  Other Ideas for Richer Chunking & Ingestion
+
+  Here are additional ideas beyond tables. Each is scoped so you can pick and
+  choose.
+
+  A. Chunk importance scoring (low effort, high impact)
+
+  Have the LLM rate each chunk 1–5 during ingestion. The score goes into
+  metadata.importance. During retrieval, importance acts as a tiebreaker: when
+  two chunks have similar cosine scores, the more important one ranks higher.
+
+  Broker reports have natural importance gradients — the cover page (target
+  price, rating) matters more than the disclaimer page. A static importance
+  score lets the retriever exploit this without any runtime LLM cost.
+
+  Cost: One extra field in the enrichment prompt (already making an LLM call if
+  enrichment is on). Zero runtime overhead.
+
+  B. Section breadcrumbs (trivial, no LLM needed)
+
+  Currently section is just the nearest heading. Store the full heading path:
+  {"section_path": ["Financial Performance", "Quarterly Trends", "Revenue"]}
+
+  This is pure string processing — pymupdf4llm's markdown already has the
+  heading hierarchy. The path helps the LLM understand where a chunk sits in the
+  report's argument structure, and could be rendered in the UI as a breadcrumb
+  trail in the source drawer.
+
+  C. Numeric fact index (medium effort)
+
+  For every chunk (not just tables), extract metric: value: unit triples:
+  ["Revenue: 450: INR crore", "EBITDA margin: 26.7: %", "PAT growth: 12.0: %
+  YoY"]
+
+  Store in metadata.facts. This enables:
+  - Fact-aware retrieval: a query for "EBITDA above 100 crore" could filter
+  chunks that don't contain EBITDA at all
+  - Fact highlighting in UI: the source drawer could bold the extracted numbers
+  - Future: a structured query mode ("show me all chunks with revenue growth >
+  10%")
+
+  Cost: One extra field in the enrichment prompt. Validation needed to catch LLM
+  hallucinations (did the LLM invent a number not in the text?).
+
+  D. Chunk provenance tracking (small)
+
+  Store which extractor produced the chunk in metadata:
+  {"extractor": "pymupdf4llm", "chunking_strategy": "structure", "page_no": 5}
+
+  When debugging retrieval quality issues, you can trace a bad answer back to
+  exactly how its source chunk was created. Useful for A/B testing chunking
+  strategies.
+
+  E. Hypothetical answer embedding (HyDE for chunks)
+
+  Instead of generating questions, generate a hypothetical dense paragraph that
+  summarizes what the chunk is about, written in the style of an analyst's
+  answer. This is the inverse of question generation — it makes the chunk look
+  like the output rather than the input.
+
+  A query embedding and a hypothetical-answer embedding are more directly
+  comparable than a query embedding and a raw-chunk embedding.
+
+  Cost: One more LLM call per chunk. Probably too expensive for every chunk, but
+  worth it for high-value sections (executive summary, investment thesis,
+  valuation).
+
+  F. Table-aware summarization (deferred)
+
+  Currently summarize_report() gets full_text(pages) — tables are embedded in
+  the prose but not explicitly labeled. Adding a [TABLE] marker in the text
+  before summarization would tell the summarization LLM "this is structured
+  data, read it carefully." Small prompt engineering change, potentially big
+  improvement in summary quality for numbers-heavy reports.
+
+  ---
+  Recommended priority
+
+  ┌──────────┬──────────────────────┬───────────────────────────────────────┐
+  │ Priority │         Item         │                  Why                  │
+  ├──────────┼──────────────────────┼───────────────────────────────────────┤
+  │          │ Table extraction +   │ Direct user value, the infrastructure │
+  │ Now      │ enrichment           │  (chunk_type, metadata) unlocks       │
+  │          │                      │ everything below                      │
+  ├──────────┼──────────────────────┼───────────────────────────────────────┤
+  │ Next     │ Section breadcrumbs  │ Pure engineering, zero LLM cost,      │
+  │          │ (B) + provenance (D) │ improves debuggability                │
+  ├──────────┼──────────────────────┼───────────────────────────────────────┤
+  │          │                      │ One extra field in the enrichment     │
+  │ Soon     │ Chunk importance (A) │ prompt, measurable retrieval quality  │
+  │          │                      │ improvement                           │
+  ├──────────┼──────────────────────┼───────────────────────────────────────┤
+  │ Later    │ Numeric fact index   │ Needs fact validation, higher risk of │
+  │          │ (C)                  │  LLM hallucination                    │
+  ├──────────┼──────────────────────┼───────────────────────────────────────┤
+  │ Defer    │ HyDE for chunks (E), │ Experimental, high compute cost per   │
+  │          │  dual embedding      │ chunk                                 │
+  └──────────┴──────────────────────┴───────────────────────────────────────┘
+
+  ---
+  Want me to start implementing? I'll begin with Phase 1 (table extraction +
+  enrichment + toggle), which also lays the foundation (metadata column,
+  chunk_type plumbing) for everything else. Or would you like to adjust the
+  enrichment prompt or pick some of the other ideas to include in round one?
+
+✻ Cooked for 1m 13s

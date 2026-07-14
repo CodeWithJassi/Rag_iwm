@@ -82,9 +82,21 @@ MIGRATIONS = [
     # Hybrid retrieval — full-text search alongside vector. Catches exact
     # terms (tickers, broker names, "EBITDA margin") that dense retrieval
     # sometimes misses. Zero new infra.
+    #
+    # NOTE: the fts column starts as GENERATED for fresh installs (see SCHEMA)
+    # but is converted to a regular column by _migrate_fts_to_regular() below
+    # so tags and enrichment text can be included in the search index.
     """ALTER TABLE chunks ADD COLUMN IF NOT EXISTS fts tsvector
        GENERATED ALWAYS AS (to_tsvector('english', content)) STORED""",
     "CREATE INDEX IF NOT EXISTS chunks_fts_idx ON chunks USING gin (fts)",
+    # JSONB metadata — tags, enrichment data, image paths, and future extensions.
+    "ALTER TABLE chunks ADD COLUMN IF NOT EXISTS metadata JSONB",
+]
+
+# Post-SCHEMA migrations that need procedural logic (conditionals, loops).
+# These run AFTER the SCHEMA and MIGRATIONS SQL has executed.
+_POST_MIGRATIONS = [
+    "_migrate_fts_to_regular",
 ]
 
 pool = ConnectionPool(PG_DSN, min_size=1, max_size=8, open=False,
@@ -155,6 +167,34 @@ def _check_embedding_dimension() -> None:
                     "All reports must be re-ingested.", actual_dim, EMBED_DIM)
 
 
+def _migrate_fts_to_regular() -> None:
+    """Convert chunks.fts from a GENERATED column to a regular column.
+
+    The generated column can only index ``chunks.content``.  We need tags and
+    enrichment text included — so we drop the generated column, re-add it as a
+    regular tsvector, and repopulate from content.  Future INSERTs will compute
+    fts in ingest.py with content + tags concatenated.
+
+    Idempotent: checks pg_attribute.attgenerated; skips if already regular.
+    """
+    with pool.connection() as conn:
+        is_generated = conn.execute(
+            "SELECT attgenerated FROM pg_attribute "
+            "WHERE attrelid = 'chunks'::regclass AND attname = 'fts' "
+            "  AND attnum > 0"
+        ).fetchone()
+        if not is_generated or is_generated[0] != 's':
+            return  # already regular, or column doesn't exist
+        logger.info("converting chunks.fts from GENERATED to regular column")
+        conn.execute("DROP INDEX IF EXISTS chunks_fts_idx")
+        conn.execute("ALTER TABLE chunks DROP COLUMN fts")
+        conn.execute("ALTER TABLE chunks ADD COLUMN fts tsvector")
+        conn.execute("UPDATE chunks SET fts = to_tsvector('english', content)")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS chunks_fts_idx ON chunks USING gin (fts)")
+        logger.info("fts migration complete — tags can now be included in search")
+
+
 def init_db() -> None:
     # Create the pgvector extension FIRST on a raw connection — the pool's
     # configure=register_vector callback needs the vector type to exist before
@@ -173,6 +213,12 @@ def init_db() -> None:
         for m in MIGRATIONS:
             conn.execute(m)
     logger.info("schema ready")
+
+    # Run procedural post-migrations.
+    for fn_name in _POST_MIGRATIONS:
+        fn = globals().get(fn_name)
+        if fn:
+            fn()
 
     # After the schema is confirmed to exist, verify the embedding column width
     # matches the configured model.  Auto-migrates with a warning on mismatch.

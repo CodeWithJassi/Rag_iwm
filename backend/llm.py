@@ -229,3 +229,108 @@ def llm_json(prompt: str, max_tokens: int = 400, label: str = "json", model: str
                 continue
     logger.warning(f"[{label}] response was not parseable JSON")
     return None
+
+
+# ------------------------------------------------------------------ vision
+# Vision-language model calls via Ollama's /api/chat endpoint.  The image is
+# read from disk, base64-encoded, and sent alongside a text prompt.  Uses the
+# same retry-on-load pattern as _try_ollama() — when the model is streaming from
+# disk to GPU (done_reason="load") we wait for it rather than failing.
+
+def llm_vision(image_path: str, prompt: str, *,
+               max_tokens: int = 400, model: str = "",
+               label: str = "vision") -> str | None:
+    """Describe an image with a vision-capable LLM.  Returns None on failure.
+
+    The image is read from disk, base64-encoded, and sent to Ollama's /api/chat
+    endpoint (which accepts an ``images`` array alongside the prompt).  Paid
+    vision providers (GPT-4o, Gemini) can be added to the failover chain later.
+    """
+    import base64
+    import time as _time
+
+    from config import VISION_BASE_URL, VISION_MODEL
+
+    effective_model = model or VISION_MODEL
+
+    # Read and encode the image.  For very large images (>10 MB encoded) we
+    # downscale via Pillow so Ollama doesn't reject the request.
+    try:
+        with open(image_path, "rb") as f:
+            raw = f.read()
+        # If the image is >8 MB raw, downscale before encoding.
+        if len(raw) > 8 * 1024 * 1024:
+            try:
+                from io import BytesIO
+                from PIL import Image
+
+                img = Image.open(BytesIO(raw))
+                w, h = img.size
+                scale = min(1.0, (8 * 1024 * 1024 / len(raw)) ** 0.5)
+                img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+                buf = BytesIO()
+                img.save(buf, format="PNG")
+                raw = buf.getvalue()
+                logger.info("[%s] downscaled %s from %dx%d to %dx%d",
+                            label, image_path, w, h, img.size[0], img.size[1])
+            except Exception:
+                pass  # if Pillow fails, try the original bytes anyway
+        b64 = base64.b64encode(raw).decode()
+    except OSError as e:
+        logger.warning("[%s] cannot read %s: %s", label, image_path, e)
+        return None
+
+    # Send to Ollama with the same retry-on-load logic as _try_ollama.
+    payload = {
+        "model": effective_model,
+        "messages": [{"role": "user", "content": prompt, "images": [b64]}],
+        "stream": False,
+        "options": {"temperature": 0.1, "num_predict": max_tokens},
+    }
+    for attempt in range(2):
+        try:
+            resp = requests.post(
+                f"{VISION_BASE_URL}/api/chat", json=payload, timeout=180)
+            resp.raise_for_status()
+            body = resp.json()
+            # Try multiple response formats — standard Ollama, proxies, OpenAI-style.
+            msg = body.get("message", {}) or {}
+            out = (msg.get("content", "") or
+                   body.get("response", "") or
+                   body.get("text", "") or
+                   (body.get("choices", [{}])[0].get("message", {}).get("content", "")
+                    if body.get("choices") else "")).strip()
+            if out:
+                logger.info("[%s] success via %s (attempt %d)",
+                            label, effective_model, attempt + 1)
+                return out
+            # Empty response — check if the model is loading.
+            done_reason = body.get("done_reason", "unknown")
+            if done_reason == "load" and attempt == 0:
+                wait = 30  # vision models are large, give them time
+                logger.info("[%s] %s is loading — waiting %ds",
+                            label, effective_model, wait)
+                _time.sleep(wait)
+                continue
+            # done_reason=length means the model hit num_predict.  Retry with
+            # double the token budget — the image probably needs more output.
+            if done_reason == "length" and attempt == 0:
+                payload["options"]["num_predict"] = max_tokens * 2
+                logger.info("[%s] %s hit token limit — retrying with %d tokens",
+                            label, effective_model,
+                            payload["options"]["num_predict"])
+                continue
+            logger.warning("[%s] %s empty response (done_reason=%s, "
+                           "eval_count=%s)",
+                           label, effective_model, done_reason,
+                           body.get("eval_count", "N/A"))
+        except Exception as e:
+            if attempt == 0:
+                logger.warning("[%s] %s failed (attempt 1): %s", label,
+                               effective_model, e)
+                _time.sleep(2)
+            else:
+                logger.warning("[%s] %s failed (attempt 2): %s", label,
+                               effective_model, e)
+
+    return None

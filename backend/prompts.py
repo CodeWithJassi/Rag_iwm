@@ -4,39 +4,81 @@ pipeline code, and so you can diff prompt changes against retrieval quality.
 
 # ==================================================================== summarise
 CHUNK_PROMPT = """You are a senior buy-side analyst reading one section of an equity research report on {company}.
-Extract ONLY facts present in the text — do not invent or extrapolate. Pull out:
-- Broker name, analyst name, recommendation (Buy/Hold/Sell), CMP, target price, valuation method
+
+Extract ONLY facts explicitly stated in the text.  DO NOT guess, infer, compute, or
+extrapolate any number that is not written down.  A hallucinated number is worse
+than a gap — the desk acts on these figures.
+
+PLACEHOLDER RULES:
+- If a figure is discussed but the exact number is not stated, write "--"
+- If a field (broker, rating, CMP, etc.) is completely absent from this section,
+  write "NOT FOUND" — do not carry over a value you saw in a different section
+- If a number is stated but you are uncertain about its unit or context, include it
+  but append "[?]" — e.g. "Revenue: Rs 450[?] Mn"
+
+Extract:
+- Broker name, analyst name, recommendation (Buy/Hold/Sell), CMP, target price,
+  valuation method — use "NOT FOUND" for each genuinely missing field
 - Key investment thesis points (max 4 bullets)
-- Financial figures: revenue, EBITDA, EBITDA margin, PAT, EPS, ROE, ROCE (historical and forecast)
+- Financial figures WITH UNITS: revenue, EBITDA, EBITDA margin, PAT, EPS, ROE,
+  ROCE (label each as historical or forecast, and the period — e.g. "FY26E")
 - Key assumptions: volume growth, margins, capex, order inflow, utilisation, pricing
 - Risks mentioned (company-specific and macro)
-Output as brief bullet points only. Skip anything not present in the text.
+
+Output as brief bullet points only.  Every number MUST carry its unit.
 
 SECTION:
 {text}
 """
 
 REDUCE_PROMPT = """You are a senior buy-side fund manager writing a quick internal note on {company} for an investment committee.
-Use ONLY the facts provided below — do not invent numbers. Keep it tight, under 500 words total.
+
+CRITICAL — ANTI-HALLUCINATION RULES:
+- Use ONLY the facts provided below.  Do NOT add any number, date, percentage, or
+  name that does not appear in the extracts.
+- If all extracts say "NOT FOUND" for a field, write "NOT FOUND" in your note
+  rather than omitting it — an explicit gap is better than silent omission.
+- If extracts disagree on a number (e.g. one says Rs 450 Cr, another says
+  Rs 4,500 Mn), report the discrepancy rather than picking one: "Rs 450 Cr
+  (alternatively stated as Rs 4,500 Mn)".
+- If a section heading is listed but no facts were extracted for it, write
+  "— No data in report" under that heading.
+- Write "—" (em-dash) for any expected field where the report genuinely provides
+  no information.  Never invent a plausible-sounding number to fill a gap.
+
 Structure it as: Recommendation & target, Thesis, Financials, Key assumptions, Risks.
+Keep it tight, under 500 words total.
 
 EXTRACTED FACTS:
 {text}
 """
 
-# Extended from the original PRICE_PROMPT: same single call now also returns the
-# broker and the rating, both of which the dashboard needs.
+# Fact extraction for the dashboard header — broker, rating, CMP, target price.
+# These four fields drive the recommendation badge and the upside gauge, so a
+# hallucinated number here is highly visible and directly misleading.
 FACTS_PROMPT = """Extract four fields from this equity research report on {company}.
-Use ONLY values explicitly stated in the text. If a field is absent, use null.
 
-- broker: the research house publishing the report (e.g. "Motilal Oswal", "ICICI Securities")
-- recommendation: exactly one of "Buy", "Hold", "Sell", or null. Map synonyms:
-  Accumulate/Add/Outperform -> Buy; Neutral/Equal-weight -> Hold; Reduce/Underperform -> Sell
-- current_price: the current market price (CMP), as a number, no currency symbol
-- target_price: the analyst's target price, as a number, no currency symbol
+RULES:
+- Use ONLY values explicitly stated in the text.  If a field is genuinely absent
+  (searched the entire cover page, not mentioned anywhere), use the string
+  "NOT FOUND" instead of null — this lets the validator distinguish "LLM output
+  was empty" from "LLM searched and found nothing."
+- Do NOT guess the broker from the file name, URL, or watermark.  If the broker
+  name is not written out in the prose (e.g. "Motilal Oswal Research"), use
+  "NOT FOUND".
+- Do NOT estimate a target price from a chart axis or a percentage move.  If the
+  exact target price is not printed as a number, use "NOT FOUND".
+
+Fields:
+- broker: the research house publishing the report.  "NOT FOUND" if absent.
+- recommendation: exactly one of "Buy", "Hold", "Sell".  Map synonyms:
+  Accumulate/Add/Outperform -> Buy; Neutral/Equal-weight -> Hold;
+  Reduce/Underperform -> Sell.  "NOT FOUND" if unstated.
+- current_price: CMP as a number, no currency symbol.  "NOT FOUND" if absent.
+- target_price: target price as a number, no currency symbol.  "NOT FOUND" if absent.
 
 Respond with ONLY a JSON object, no prose, no markdown fences:
-{{"broker": ..., "recommendation": ..., "current_price": ..., "target_price": ...}}
+{{"broker": "...", "recommendation": "...", "current_price": ..., "target_price": ...}}
 
 REPORT TEXT:
 {text}
@@ -133,6 +175,12 @@ Rules:
 - If the context contains similar figures or metrics from different sections or time
   periods, explicitly state which section or period each figure comes from. Do not
   conflate numbers from different contexts.
+- UNITS ARE MANDATORY.  When citing a figure, ALWAYS include its unit — crore, lakh,
+  million, billion, %, bps, ₹, $, times (x), etc.  If a table row is labelled
+  "EBITDA (Rs Mn)" and the cell shows "5,248", the answer MUST say "Rs 5,248 million"
+  or "Rs 524.8 crore" — NOT "5,248".  A number without a unit is an incomplete answer,
+  even if the citation marker is present.  If the context includes a [UNITS: ...] note
+  above a table, apply those units to every figure you cite from that table.
 
 CONTEXT PASSAGES:
 {context}
@@ -227,4 +275,123 @@ Example: [3, 7, 11] means chunks start at paragraphs 0, 3, 7, and 11.
 
 TEXT (paragraphs numbered for reference):
 {paragraphs}
+"""
+
+# ==================================================================== table enrichment
+TABLE_ENRICH_PROMPT = """You are analyzing a table from an equity research report on {company}.
+
+TABLE (markdown):
+{markdown}
+
+Return a JSON object with SIX fields.  Be specific — use the actual numbers,
+dates, entity names, and units visible in the table.
+
+1. "questions": 3-5 natural-language questions an equity analyst might ask that
+   this exact table answers.  Write them the way an analyst types into a search
+   box — concise, specific, varying the phrasing.  Include time periods and
+   units in the questions themselves (e.g. "What was EBITDA in Rs Mn for FY27E?"
+   not "What was EBITDA for FY27E?").
+
+2. "summary": One sentence describing what this table shows.  State the entity,
+   time period, direction (up/down/flat), magnitude WITH UNITS, and the most
+   salient figure.  Example: "Thyrocare's quarterly revenue grew 12% QoQ to
+   Rs 450cr in Q3 FY24 with EBITDA margins expanding 180 bps."
+
+3. "key_metrics": A list of the most decision-relevant facts from this table.
+   Each item MUST include the unit — write "FY27E EBITDA: Rs 5,248 Mn" not
+   "FY27E EBITDA: 5,248".  If the unit appears in the column header or row
+   label (e.g. "(Rs Mn)", "(%)", "(x)"), attach it to every value you cite.
+   Pull totals, growth rates, margins, extremes (highest / lowest), and
+   year-end figures.  Max 8 items.  Prefer exact numbers from the table — do
+   not compute derived values unless the table shows them.
+
+4. "unit_context": A single sentence declaring the units this table uses.  Scan
+   the column headers and row labels for unit indicators — "(Rs Mn)", "(Rs Cr)",
+   "(%)", "(x)", "($)", "lakhs", "millions", "billions", "bps", etc.  Be
+   comprehensive: if the table has both monetary and percentage columns, mention
+   both.  Example: "Monetary values in Rs millions (Rs Mn); percentages and
+   margins in %."
+
+5. "tags": 4-8 single-word or short-phrase topic tags (lowercase).  Choose tags
+   that would help someone find this table by searching.  Include:
+   - The type of data: "quarterly", "annual", "segment_breakdown", "peer_comparison",
+     "p&l", "balance_sheet", "cash_flow", "ratio", "valuation_multiple"
+   - The financial topics covered: "revenue", "margin", "profitability", "growth",
+     "debt", "capex", "operations", "guidance", "dividend"
+   - Any specific line items: "ebitda", "pat", "eps", "roe", " roce"
+   Only include tags where the table actually contains those topics.  Do not tag
+   "debt" if the table has no debt data.  Prefer the tag labels used in equity
+   research — use "revenue" not "sales_figure", "margin" not "profitability_pct".
+
+6. "importance": an integer from 1 (lowest) to 5 (highest) rating how
+   decision-relevant this table is for an equity analyst.  Use these criteria:
+   - 5: Contains target price, recommendation, valuation multiples, or summary
+        financials (revenue, EBITDA, PAT) that directly support an investment call.
+   - 4: Detailed segment breakdowns, quarterly trends, peer comparison tables,
+        or forward estimates/guidance.
+   - 3: Supporting data — cost breakdowns, ratio analysis, capex plans, or
+        historical financials beyond the forecast period.
+   - 2: Background data — industry stats, macro indicators, or diluted per-share
+        metrics that are secondary to the main thesis.
+   - 1: Administrative — page headers, index of tables, glossary entries,
+        disclaimers, or formatting artifacts misidentified as tables.
+
+Respond with ONLY a JSON object, no prose, no markdown fences.
+{{"questions": [...], "summary": "...", "key_metrics": [...], "unit_context": "...", "tags": [...], "importance": 3}}
+"""
+
+# ==================================================================== image captioning
+IMAGE_CAPTION_PROMPT = """You are analyzing an image from an equity research report on {company}.
+
+Describe what you see in complete detail, as a single paragraph.  Include:
+
+1. TYPE: What kind of visual is this?  (line chart, bar chart, pie chart, table
+   screenshot, diagram, handwritten note, photo, logo, map, or other)
+
+2. DATA: Every number, label, percentage, and unit visible.  Read row labels,
+   column headers, axis titles, legend entries, and data point callouts.  If a
+   number has a unit (Rs Mn, %, bps, x, $, etc.) INCLUDE THE UNIT.  "Revenue:
+   Rs 4,500 Mn in FY26E" — not "Revenue: 4,500."
+
+3. TREND: The key direction, comparison, or insight the visual conveys.  Is
+   something growing, declining, accelerating, inflecting?  Which is the highest /
+   lowest value shown?  What is the time period?
+
+4. ANNOTATIONS: Any callouts, arrows, circled numbers, handwritten marks, or
+   text boxes overlaid on the visual.  Broker reports often have analyst
+   scribbles or margin notes — transcribe them.
+
+5. SOURCE: If the image has a source line or footnote (e.g. "Source: Company,
+   IWM Research"), note it.
+
+Be specific and factual.  Do NOT guess values you cannot clearly read — say
+"illegible" if text is too blurry.  Write in third person, referring to the
+company by name.  Output as a single paragraph with no headings or formatting.
+"""
+
+# ==================================================================== OCR
+# Transcription prompt — different from the captioning prompt above.  This asks
+# the VLM to reproduce ALL visible text faithfully, preserving headings,
+# paragraphs, table structure, and noting handwritten marks.  The output becomes
+# the page text that flows into chunking, summarisation, and retrieval.
+
+OCR_PROMPT = """Transcribe ALL visible text from this page of an equity research report on {company}.
+
+Rules:
+- Reproduce every word, number, heading, and paragraph exactly as it appears.
+  Preserve the reading order (top to bottom, left to right).
+- For tables: use markdown table format (| col | col |).  Preserve all column
+  headers, row labels, and numeric values WITH their units (Rs Mn, %, bps, etc.).
+  Even if the table is poorly printed or skewed, do your best to reconstruct it.
+- For handwritten notes, annotations, or margin scribbles: transcribe them inside
+  [HANDWRITTEN: ...] markers at the position where they appear on the page.
+  Analyst scribbles often contain important corrections or observations — include
+  them faithfully.
+- For misprinted or blurry text: if you can reasonably infer the value from
+  context (e.g. a smudged digit in a column of numbers), include it with a [?]
+  marker: "Revenue: Rs 4[?]50 Mn".  If completely illegible, write [ILLEGIBLE].
+- For charts and graphs: describe them briefly in [CHART: ...] markers — note
+  the chart type, axis labels, visible data points, and the key trend shown.
+- Output ONLY the transcribed text.  No preamble, no commentary, no markdown
+  fences.  The output should look like the original page rendered as plain text.
 """

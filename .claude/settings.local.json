@@ -41,7 +41,9 @@
       "Bash(node --check -)",
       "Bash(xxd)",
       "Bash(sed '1d;$d')",
-      "Bash(node --check /tmp/check_syntax.js)"
+      "Bash(node --check /tmp/check_syntax.js)",
+      "Bash(node --check /tmp/check_js.js)",
+      "Bash(grep -n \"def table_chunks\\\\|logger.info.*table chunks\\\\|return out$\" /mnt/e/for_ubuntu/claude_dev/rag_project_iwm/backend/chunking.py)"
     ]
   }
 }

@@ -98,6 +98,20 @@ aside{
   display:grid;place-items:center;font-size:17px;line-height:1;
 }
 .icon-btn:hover{background:var(--raise);color:var(--text)}
+/* Mini toggle for ingestion settings (table extraction) */
+.mini-toggle{
+  display:flex;align-items:center;gap:5px;font-size:10px;color:var(--faint);
+  font-family:var(--mono);letter-spacing:.06em;padding:3px 7px;
+  border:1px solid var(--line);border-radius:14px;cursor:pointer;
+  transition:border-color .15s,color .15s;
+}
+.mini-toggle:hover{color:var(--muted)}
+.mini-toggle[data-on="1"]{border-color:var(--accent);color:var(--accent)}
+.mini-dot{
+  width:9px;height:9px;border-radius:50%;background:var(--line);
+  transition:background .15s;
+}
+.mini-toggle[data-on="1"] .mini-dot{background:var(--accent)}
 .rail-list{overflow-y:auto;padding:0 10px 12px}
 
 /* ---------------------------------------------------------- report card */
@@ -243,6 +257,12 @@ aside{
 }
 .src-num{color:var(--accent)}
 .src-body{color:var(--muted);line-height:1.5}
+.src-thumb{
+  display:block;max-width:240px;max-height:180px;border-radius:6px;
+  border:1px solid var(--line);margin-bottom:8px;object-fit:contain;
+  background:var(--raise);
+}
+.src-thumb:hover{border-color:var(--accent)}
 
 .plan{font-size:13px;color:var(--muted)}
 .plan li{margin:3px 0 3px 16px}
@@ -339,6 +359,12 @@ aside{
   <button class="verbose" id="verbose" data-on="0" aria-pressed="false">
     <span class="switch"></span> Verbose
   </button>
+  <button class="deep" id="extract-tables-hdr" data-on="1" aria-pressed="true">
+    <span class="switch"></span> Tables
+  </button>
+  <button class="deep" id="ocr-hdr" data-on="1" aria-pressed="true">
+    <span class="switch"></span> Scan
+  </button>
 </header>
 
 <main>
@@ -365,7 +391,7 @@ aside{
 // ============================================================
 // State. One report selected, one session inside it. Nothing else.
 // ============================================================
-const S = { reports: [], report: null, sessions: [], session: null, turns: [], deep: false, verbose: false, busy: false, model: '' };
+const S = { reports: [], report: null, sessions: [], session: null, turns: [], deep: false, verbose: false, busy: false, model: '', extract_tables: true, ocr: true };
 let _abort = null;  // AbortController for in-flight chat fetch
 
 // Sync S.deep / S.verbose from the DOM toggle buttons so the JS state
@@ -648,8 +674,9 @@ function botHTML(t) {
       <div class="src">
         <div class="src-head"><span class="src-num">[${c.n}]</span>
           <span>PAGE ${c.page_no}</span>${c.section ? `<span>${esc(c.section)}</span>` : ''}
+          ${c.chunk_type && c.chunk_type !== 'text' ? `<span class="chip">${c.chunk_type.toUpperCase()}</span>` : ''}
           <span>SIM ${c.similarity}</span></div>
-        <div class="src-body">${esc(c.snippet)}…</div>
+        <div class="src-body">${c.chunk_type === 'image' ? `<a href="/api/images/${c.chunk_id}" target="_blank"><img src="/api/images/${c.chunk_id}" class="src-thumb" loading="lazy" alt="Chart from page ${c.page_no}"></a>` : ''}${esc(c.snippet)}…</div>
       </div>`).join('')}</div>` : ''}
     ${subs.length > 1 ? `<div class="drawer plan" id="plan-${t.id}" hidden>
       <ul>${subs.map(s => `<li>${esc(s)}</li>`).join('')}</ul></div>` : ''}
@@ -763,12 +790,34 @@ document.getElementById('picker').onchange = async e => {
   if (!company) return;
   const fd = new FormData();
   fd.append('company', company); fd.append('file', file);
+  fd.append('extract_tables', S.extract_tables ? '1' : '0');
+  fd.append('ocr_enabled', S.ocr ? '1' : '0');
   const { id } = await api('/reports', { method: 'POST', body: fd });
   e.target.value = '';
   await loadReports(); selectReport(id);
 };
 
 document.getElementById('newchat').onclick = newSession;
+document.getElementById('extract-tables-hdr').onclick = e => {
+  S.extract_tables = !S.extract_tables;
+  const b = e.currentTarget;
+  b.dataset.on = S.extract_tables ? '1' : '0';
+  b.setAttribute('aria-pressed', String(S.extract_tables));
+  b.style.borderColor = S.extract_tables ? 'var(--accent)' : '';
+  b.style.color = S.extract_tables ? '' : '';
+  b.style.background = S.extract_tables ? '' : '';
+  b.querySelector('.switch').style.background = S.extract_tables ? '' : '';
+};
+document.getElementById('ocr-hdr').onclick = e => {
+  S.ocr = !S.ocr;
+  const b = e.currentTarget;
+  b.dataset.on = S.ocr ? '1' : '0';
+  b.setAttribute('aria-pressed', String(S.ocr));
+  b.style.borderColor = S.ocr ? 'var(--accent)' : '';
+  b.style.color = S.ocr ? '' : '';
+  b.style.background = S.ocr ? '' : '';
+  b.querySelector('.switch').style.background = S.ocr ? '' : '';
+};
 document.getElementById('deep').onclick = e => {
   S.deep = !S.deep;
   const b = e.currentTarget;
