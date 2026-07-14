@@ -367,6 +367,23 @@ aside{
 // ============================================================
 const S = { reports: [], report: null, sessions: [], session: null, turns: [], deep: false, verbose: false, busy: false, model: '' };
 let _abort = null;  // AbortController for in-flight chat fetch
+
+// Sync S.deep / S.verbose from the DOM toggle buttons so the JS state
+// never drifts from what the user sees — fixes a class of bugs where
+// toggles appear on but send() reads stale false values.
+const syncToggles = () => {
+  const deepBtn = document.getElementById('deep');
+  const verboseBtn = document.getElementById('verbose');
+  if (deepBtn) {
+    S.deep = deepBtn.dataset.on === '1';
+    deepBtn.setAttribute('aria-pressed', String(S.deep));
+  }
+  if (verboseBtn) {
+    S.verbose = verboseBtn.dataset.on === '1';
+    verboseBtn.setAttribute('aria-pressed', String(S.verbose));
+  }
+};
+
 const api = async (path, opts = {}) => {
   const r = await fetch('/api' + path, opts);
   if (r.status === 204) return null;
@@ -472,7 +489,7 @@ async function loadSessions() {
 async function newSession() {
   if (!S.report || S.report.status !== 'ready') return;
   const { id } = await api(`/reports/${S.report.id}/sessions`, { method: 'POST' });
-  selectSession(id);  // selectSession calls loadSessions() internally
+  await selectSession(id);  // must await: otherwise the floating promise overwrites S.turns mid-send()
 }
 async function dropSession(id) {
   await api(`/sessions/${id}`, { method: 'DELETE' });
@@ -676,11 +693,19 @@ const scrollThread = () => {
 // Send
 // ============================================================
 async function send() {
+  syncToggles();  // ensure S.deep / S.verbose match the DOM before sending
   const q = document.getElementById('q');
   const text = q.value.trim();
   if (!text || S.busy) return;
 
-  if (!S.session) { await newSession(); return send(); }
+  if (!S.session) {
+    // newSession → selectSession → renderStage recreates the textarea,
+    // so save the query text before the DOM is replaced.
+    await newSession();
+    const newQ = document.getElementById('q');
+    if (newQ) { newQ.value = text; newQ.style.height = 'auto'; newQ.style.height = Math.min(newQ.scrollHeight, 150) + 'px'; }
+    return send();
+  }
 
   q.value = ''; q.style.height = 'auto';
   S.turns.push({ role: 'user', content: text });

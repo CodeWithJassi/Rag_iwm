@@ -198,11 +198,18 @@ def chat(session_id: int, req: ChatRequest):
         scores = judge.validate(result["standalone"], result["context"],
                                 result["answer"], model=req.model)
 
-    memory.add_turn(session_id, "assistant", result["answer"],
-                    standalone=result["standalone"],
-                    sub_questions=result["sub_questions"],
-                    citations=result["citations"],
-                    scores=scores, abstained=result["abstained"])
+    try:
+        memory.add_turn(session_id, "assistant", result["answer"],
+                        standalone=result["standalone"],
+                        sub_questions=result["sub_questions"],
+                        citations=result["citations"],
+                        scores=scores, abstained=result["abstained"])
+    except Exception:
+        # Session may have been deleted while the pipeline was running
+        # (user clicked × in another tab, or the old frontend race condition).
+        # The answer is still returned to the caller — we just can't persist it.
+        logger.warning("session %d deleted during pipeline — assistant turn not saved",
+                       session_id)
 
     return {"answer": result["answer"], "abstained": result["abstained"],
             "reason": result["reason"], "standalone": result["standalone"],

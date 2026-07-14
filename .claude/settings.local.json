@@ -38,7 +38,10 @@
       "Bash(node --check static/index.html)",
       "Bash(./venv/bin/pip install *)",
       "Bash(./venv/bin/python3 *)",
-      "Bash(node --check -)"
+      "Bash(node --check -)",
+      "Bash(xxd)",
+      "Bash(sed '1d;$d')",
+      "Bash(node --check /tmp/check_syntax.js)"
     ]
   }
 }
