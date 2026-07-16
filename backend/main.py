@@ -1,4 +1,6 @@
 """FastAPI app. Serves the dashboard and the six endpoints behind it."""
+import asyncio
+import json
 import logging
 import shutil
 import threading
@@ -12,10 +14,11 @@ from contextlib import asynccontextmanager
 warnings.filterwarnings("ignore", message=".*leaked semaphore.*")
 
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+import agentic
 import judge
 import memory
 import rerank
@@ -33,6 +36,10 @@ logger = logging.getLogger(__name__)
 # for a single-user internal tool contention is essentially zero.
 _cancel: dict[int, threading.Event] = {}
 _cancel_lock = threading.Lock()
+
+# Async cancel events for the agentic SSE endpoint.  asyncio.Event is used
+# because the SSE generator is async and can await on it between loop steps.
+_cancel_async: dict[int, asyncio.Event] = {}
 
 REPORT_COLS = ("id, company, broker, file_name, uploaded_at, summary, recommendation, "
                "current_price, target_price, n_chunks, status, error")
@@ -52,8 +59,10 @@ app = FastAPI(title="IWM Research — Report Desk", lifespan=lifespan)
 class ChatRequest(BaseModel):
     query: str
     deep_search: bool = False
-    model: str = ""  # empty -> use LLM_MODEL default
-    verbose: bool = False  # return pipeline trace for the UI to render
+    agentic: bool = False     # use agentic ReAct loop instead of fixed pipeline
+    mode: str = "normal"      # "normal" | "deep" | "agentic" — explicit selector
+    model: str = ""           # empty -> use LLM_MODEL default
+    verbose: bool = False     # return pipeline trace for the UI to render
 
 
 def _get_report(report_id: int) -> dict:
@@ -224,13 +233,128 @@ def chat(session_id: int, req: ChatRequest):
             "trace": result.get("trace", [])}
 
 
+# ------------------------------------------------------------------ agentic chat (SSE)
+
+@app.post("/api/sessions/{session_id}/chat-agentic")
+async def chat_agentic(session_id: int, req: ChatRequest):
+    """Agentic RAG with Server-Sent Events streaming.
+
+    Returns a ``StreamingResponse`` that emits SSE events for each step of the
+    agentic loop — plan, tool execution, reflection, final synthesis.  The
+    frontend reads the stream via ``fetch()`` + ``ReadableStream`` and renders
+    each step live so the analyst can watch the research happen.
+    """
+    sess = query("SELECT report_id FROM sessions WHERE id=%s",
+                 (session_id,), one=True)
+    if not sess:
+        raise HTTPException(404, "Session not found")
+    report = _get_report(sess["report_id"])
+    if report["status"] != "ready":
+        raise HTTPException(409,
+                            f"Report is {report['status']} — not ready to query")
+
+    user_query = req.query.strip()
+    if not user_query:
+        raise HTTPException(400, "Query is required")
+
+    history = memory.get_history(session_id)
+
+    # Register an async cancel event so the Stop button can interrupt the loop.
+    cancel_evt = asyncio.Event()
+    _cancel_async[session_id] = cancel_evt
+
+    # Pre-create the user turn and a placeholder assistant turn.  The placeholder
+    # is updated after the agentic loop finishes (or on cancel / error).
+    memory.add_turn(session_id, "user", user_query)
+    memory.autotitle(session_id, user_query)
+    assistant_turn_id = memory.add_turn(
+        session_id, "assistant", "",
+        standalone=user_query, abstained=True,
+    )
+
+    async def _stream():
+        """Inner async generator that yields SSE events and captures the final
+        result for persistence."""
+        final_payload: dict | None = None
+        steps_log: list[dict] = []
+        try:
+            agen = agentic.answer(
+                report, user_query, history,
+                model=req.model, verbose=req.verbose,
+                cancel_event=cancel_evt,
+            )
+            async for event in agen:
+                yield event
+                # Parse plan / tool_result events to accumulate steps_log for
+                # database persistence.
+                try:
+                    obj = json.loads(event.removeprefix("data: "))
+                except (json.JSONDecodeError, ValueError):
+                    continue
+
+                if obj.get("type") == "plan":
+                    steps_log.append({
+                        "step": obj.get("step"),
+                        "tool": obj.get("tool"),
+                        "params": obj.get("params"),
+                        "thought": obj.get("thought"),
+                        "result": None,
+                    })
+                elif obj.get("type") == "tool_result":
+                    # Attach the result to the matching plan step.
+                    for s in reversed(steps_log):
+                        if (s.get("step") == obj.get("step")
+                                and s.get("tool") == obj.get("tool")):
+                            s["result"] = obj.get("summary", "")
+                            break
+                elif obj.get("type") == "final":
+                    final_payload = obj
+
+        except Exception as e:
+            logger.exception("agentic SSE stream failed for session %d", session_id)
+            yield agentic._sse("error", message=str(e))
+        finally:
+            # Persist the final answer and reasoning traces.
+            if final_payload:
+                memory.update_turn(
+                    assistant_turn_id,
+                    content=final_payload.get("answer", ""),
+                    citations=final_payload.get("citations", []),
+                    scores=final_payload.get("scores"),
+                    abstained=final_payload.get("abstained", False),
+                )
+            if steps_log:
+                try:
+                    memory.save_reasoning_traces(assistant_turn_id, steps_log)
+                except Exception:
+                    logger.exception("failed to persist reasoning traces "
+                                     "for turn %d", assistant_turn_id)
+            _cancel_async.pop(session_id, None)
+
+    return StreamingResponse(
+        _stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",  # disable nginx buffering
+        },
+    )
+
+
 @app.post("/api/sessions/{session_id}/cancel", status_code=200)
-def cancel_chat(session_id: int):
+async def cancel_chat(session_id: int):
     """Signal the in-flight chat pipeline for this session to stop.
 
-    The chat endpoint checks the cancel token between pipeline stages.  If the
-    token is set it raises CancelledError, which is caught to return a partial
-    result.  Idempotent — calling it when nothing is running is a no-op."""
+    Checks both the sync cancel token (Normal/Deep mode via threading.Event)
+    and the async cancel token (Agentic mode via asyncio.Event).  Idempotent —
+    calling it when nothing is running is a no-op."""
+    # Async cancel (agentic mode).
+    evt_async = _cancel_async.get(session_id)
+    if evt_async:
+        evt_async.set()
+        logger.info("cancel requested for agentic session %d", session_id)
+    # Sync cancel (normal/deep mode).
     with _cancel_lock:
         evt = _cancel.get(session_id)
     if evt:

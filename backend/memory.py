@@ -68,3 +68,55 @@ def autotitle(session_id: int, first_query: str) -> None:
     title = (first_query[:60] + "…") if len(first_query) > 60 else first_query
     execute("UPDATE sessions SET title=%s WHERE id=%s AND title='New chat'",
             (title, session_id))
+
+
+# ------------------------------------------------------------------ reasoning traces
+# Agentic mode stores the planner's step-by-step reasoning separately from the
+# final chat answer.  FK to turns.id so CASCADE delete cleans up automatically.
+
+def update_turn(turn_id: int, *, content: str = "",
+                citations=None, scores=None, abstained: bool = False) -> None:
+    """Update an existing turn row — used when the SSE endpoint creates a
+    placeholder turn before the agentic loop completes."""
+    execute(
+        """UPDATE turns
+              SET content = %s, citations = %s, scores = %s, abstained = %s
+            WHERE id = %s""",
+        (content,
+         json.dumps(citations) if citations else None,
+         json.dumps(scores) if scores else None,
+         abstained, turn_id),
+    )
+
+
+def save_reasoning_traces(turn_id: int, steps: list[dict]) -> None:
+    """Persist all reasoning steps for a turn in a single transaction.
+    Each step is a dict with keys: tool, params, result, thought, reflection."""
+    from db import pool
+    with pool.connection() as conn:
+        for i, step in enumerate(steps, start=1):
+            conn.execute(
+                """INSERT INTO reasoning_traces
+                       (turn_id, step, tool, input_data, output_data,
+                        plan_text, reflection)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s)""",
+                (turn_id, i,
+                 step.get("tool"),
+                 json.dumps(step.get("params")) if step.get("params") else None,
+                 json.dumps(step.get("result")) if isinstance(
+                     step.get("result"), (dict, list)) else str(step.get("result", "")),
+                 step.get("thought"),
+                 step.get("reflection")),
+            )
+
+
+def get_reasoning_traces(turn_id: int) -> list[dict]:
+    """Retrieve reasoning traces for a given turn, ordered by step."""
+    return query(
+        """SELECT step, tool, input_data, output_data,
+                  plan_text, reflection, created_at
+             FROM reasoning_traces
+            WHERE turn_id = %s
+         ORDER BY step""",
+        (turn_id,),
+    )

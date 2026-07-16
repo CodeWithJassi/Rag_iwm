@@ -235,5 +235,12 @@ OCR_CONCURRENCY = 3             # parallel VLM transcription calls
 OCR_MAX_TOKENS = 600             # per-page transcription — needs room for full page
 OCR_DPI = 200                    # render resolution for page images
 
+# ---------------------------------------------------------------- agentic rag
+# Planner-driven multi-step loop with tools.  Replaces the decompose→rephrase
+# pipeline when the user selects Agentic mode.
+AGENTIC_MAX_STEPS = 10           # max planner loop iterations before forced synthesis
+AGENTIC_RETRIEVE_TOP_K = 12      # chunks returned by retrieve() tool — wider pool
+                                  # for the planner than RERANK_TOP_K (6)
+
 # ---------------------------------------------------------------- memory
 MEMORY_TURNS = 3         # turns of history fed to the contextualiser

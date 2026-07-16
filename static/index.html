@@ -58,6 +58,15 @@ header{
 .deep[data-on="1"] .switch{background:var(--accent)}
 .deep[data-on="1"] .switch::after{transform:translateX(13px);background:#fff}
 
+.mode-group{display:flex;gap:0;border:1px solid var(--line);border-radius:20px;overflow:hidden}
+.mode-btn{
+  font-size:12px;padding:5px 13px;color:var(--muted);font-family:var(--sans);
+  border-right:1px solid var(--line);transition:all .15s;cursor:pointer;
+}
+.mode-btn:last-child{border-right:none}
+.mode-btn[aria-pressed="true"]{background:var(--accent-dim);color:var(--accent);font-weight:500}
+.mode-btn:hover:not([aria-pressed="true"]){color:var(--text)}
+
 .verbose{
   display:flex;align-items:center;gap:9px;font-size:13px;color:var(--muted);
   padding:6px 11px;border:1px solid var(--line);border-radius:20px;
@@ -303,6 +312,23 @@ aside{
 .meter i{display:block;height:100%;border-radius:2px;background:var(--buy)}
 .meter.bad i{background:var(--sell)}
 
+/* agentic reasoning steps — lighter than answer text, collapsible */
+.agentic-steps{display:flex;flex-direction:column;gap:8px;max-height:420px;overflow-y:auto}
+.agentic-step{border-left:2px solid var(--line);padding-left:11px;transition:border-color .2s}
+.agentic-step.step-pending{border-left-color:var(--accent)}
+.agentic-step.step-error{border-left-color:var(--sell)}
+.agentic-step.step-done{border-left-color:var(--faint)}
+.step-header{display:flex;gap:8px;align-items:center;font-family:var(--mono);font-size:10px}
+.step-num{color:var(--accent);font-weight:500}
+.step-tool{color:var(--muted)}
+.step-thought{font-size:12px;color:var(--muted);margin:4px 0;line-height:1.5}
+.step-params{font-family:var(--mono);font-size:10px;color:var(--faint);margin:3px 0;word-break:break-all}
+.step-result{font-size:12px;color:var(--text);margin:4px 0;line-height:1.5}
+.step-live .step-header .dots{display:inline-flex;gap:3px;align-items:center}
+.step-live .step-header .dots i{width:3px;height:3px;border-radius:50%;background:var(--accent);animation:blink 1.2s infinite}
+.step-live .step-header .dots i:nth-child(2){animation-delay:.2s}
+.step-live .step-header .dots i:nth-child(3){animation-delay:.4s}
+
 /* composer */
 .composer{border-top:1px solid var(--line);padding:14px 32px 20px;background:var(--ink)}
 .box{
@@ -353,9 +379,11 @@ aside{
   <div class="wordmark">Report Desk <span>· equity research</span></div>
   <div class="spacer"></div>
   <select class="model-sel" id="model-sel" aria-label="Select LLM model"></select>
-  <button class="deep" id="deep" data-on="0" aria-pressed="false">
-    <span class="switch"></span> Deep search
-  </button>
+  <div class="mode-group" id="mode-group" role="radiogroup" aria-label="Search mode">
+    <button class="mode-btn" data-mode="normal" aria-pressed="true" role="radio">Normal</button>
+    <button class="mode-btn" data-mode="deep" aria-pressed="false" role="radio">Deep</button>
+    <button class="mode-btn" data-mode="agentic" aria-pressed="false" role="radio">Agentic</button>
+  </div>
   <button class="verbose" id="verbose" data-on="0" aria-pressed="false">
     <span class="switch"></span> Verbose
   </button>
@@ -391,19 +419,12 @@ aside{
 // ============================================================
 // State. One report selected, one session inside it. Nothing else.
 // ============================================================
-const S = { reports: [], report: null, sessions: [], session: null, turns: [], deep: false, verbose: false, busy: false, model: '', extract_tables: true, ocr: true };
+const S = { reports: [], report: null, sessions: [], session: null, turns: [], mode: 'normal', verbose: false, busy: false, model: '', extract_tables: true, ocr: true };
 let _abort = null;  // AbortController for in-flight chat fetch
 
-// Sync S.deep / S.verbose from the DOM toggle buttons so the JS state
-// never drifts from what the user sees — fixes a class of bugs where
-// toggles appear on but send() reads stale false values.
+// Sync S.verbose from the DOM toggle button so the JS state never drifts.
 const syncToggles = () => {
-  const deepBtn = document.getElementById('deep');
   const verboseBtn = document.getElementById('verbose');
-  if (deepBtn) {
-    S.deep = deepBtn.dataset.on === '1';
-    deepBtn.setAttribute('aria-pressed', String(S.deep));
-  }
   if (verboseBtn) {
     S.verbose = verboseBtn.dataset.on === '1';
     verboseBtn.setAttribute('aria-pressed', String(S.verbose));
@@ -610,8 +631,9 @@ function renderStage(force) {
         <button class="send" id="send" aria-label="Send">↑</button>
         <button class="stop-btn" id="stop" aria-label="Stop" style="display:none">■</button>
       </div>
-      <div class="hint">ANSWERS ARE GROUNDED IN THIS REPORT ONLY · ENTER TO SEND</div>
+      <div class="hint"></div>
     </div>` : ''}`;
+  if (tab === 'chat') updateHint();
 
   st.querySelectorAll('.tab').forEach(t => t.onclick = () => renderStage(t.dataset.t));
   if (tab === 'chat') {
@@ -655,22 +677,24 @@ function renderThread() {
 
 function botHTML(t) {
   const cites = t.citations || [], subs = t.sub_questions || [], sc = t.scores;
-  const trace = t.trace || [];
+  const trace = t.trace || [], rsteps = t.reasoning_steps || [];
+  const live = t.live;
   const body = t.abstained
     ? `<div class="bot-body abstain">${esc(t.content)}</div>`
-    : `<div class="bot-body">${citeify(fmt(t.content))}</div>`;
+    : (live ? `<div class="agentic-steps"></div>` : `<div class="bot-body">${citeify(fmt(t.content))}</div>`);
 
   const foot = [];
   if (cites.length) foot.push(`<button class="pill" data-drawer="src-${t.id}" aria-expanded="false">${cites.length} SOURCES</button>`);
   if (subs.length > 1) foot.push(`<button class="pill" data-drawer="plan-${t.id}" aria-expanded="false">SEARCH PLAN · ${subs.length}</button>`);
+  if (rsteps.length) foot.push(`<button class="pill" data-drawer="rs-${t.id}" aria-expanded="false">REASONING · ${rsteps.length} steps</button>`);
 
   const meter = (k, v) => `<div><div class="score-k">${k}</div>
     <div class="score-v">${(v * 100).toFixed(0)}%</div>
     <div class="meter ${v < .7 ? 'bad' : ''}"><i style="width:${v * 100}%"></i></div></div>`;
 
-  return `<div class="msg-bot">${body}
-    ${foot.length ? `<div class="bot-foot">${foot.join('')}</div>` : ''}
-    ${cites.length ? `<div class="drawer" id="src-${t.id}" hidden>${cites.map(c => `
+  return `<div class="msg-bot"${live ? ` data-turn-id="${t.id}"` : ''}>${body}
+    ${!live && foot.length ? `<div class="bot-foot">${foot.join('')}</div>` : ''}
+    ${!live && cites.length ? `<div class="drawer" id="src-${t.id}" hidden>${cites.map(c => `
       <div class="src">
         <div class="src-head"><span class="src-num">[${c.n}]</span>
           <span>PAGE ${c.page_no}</span>${c.section ? `<span>${esc(c.section)}</span>` : ''}
@@ -678,9 +702,9 @@ function botHTML(t) {
           <span>SIM ${c.similarity}</span></div>
         <div class="src-body">${c.chunk_type === 'image' ? `<a href="/api/images/${c.chunk_id}" target="_blank"><img src="/api/images/${c.chunk_id}" class="src-thumb" loading="lazy" alt="Chart from page ${c.page_no}"></a>` : ''}${esc(c.snippet)}…</div>
       </div>`).join('')}</div>` : ''}
-    ${subs.length > 1 ? `<div class="drawer plan" id="plan-${t.id}" hidden>
+    ${!live && subs.length > 1 ? `<div class="drawer plan" id="plan-${t.id}" hidden>
       <ul>${subs.map(s => `<li>${esc(s)}</li>`).join('')}</ul></div>` : ''}
-    ${trace.length && S.verbose ? `<div class="trace-panel">
+    ${!live && trace.length && S.verbose ? `<div class="trace-panel">
       <div class="trace-head">🔍 PIPELINE TRACE <span>${trace.length} steps · ${trace[trace.length-1]?.ms || 0} ms total</span></div>
       <div class="trace-steps">
         ${trace.map(st => `
@@ -694,7 +718,18 @@ function botHTML(t) {
           </div>`).join('')}
       </div>
     </div>` : ''}
-    ${sc ? `<div class="scores">${meter('FAITHFULNESS', sc.faithfulness)}${meter('RELEVANCY', sc.relevancy)}</div>` : ''}
+    ${!live && rsteps.length ? `<div class="drawer" id="rs-${t.id}" hidden>
+      <div class="agentic-steps" style="max-height:420px;overflow-y:auto">${rsteps.map(s => `
+        <div class="agentic-step step-done">
+          <div class="step-header">
+            <span class="step-num">Step ${s.step}</span>
+            <span class="step-tool">${esc(s.tool || '')}</span>
+          </div>
+          ${s.thought ? `<div class="step-thought">${esc(s.thought)}</div>` : ''}
+          ${s.summary ? `<div class="step-result">${esc(s.summary)}</div>` : ''}
+        </div>`).join('')}</div>
+    </div>` : ''}
+    ${!live && sc ? `<div class="scores">${meter('FAITHFULNESS', sc.faithfulness)}${meter('RELEVANCY', sc.relevancy)}</div>` : ''}
   </div>`;
 }
 
@@ -720,7 +755,7 @@ const scrollThread = () => {
 // Send
 // ============================================================
 async function send() {
-  syncToggles();  // ensure S.deep / S.verbose match the DOM before sending
+  syncToggles();  // ensure S.verbose matches the DOM before sending
   const q = document.getElementById('q');
   const text = q.value.trim();
   if (!text || S.busy) return;
@@ -740,10 +775,18 @@ async function send() {
   toggleComposerButtons(true);
   renderThread(); scrollThread();
 
+  if (S.mode === 'agentic') {
+    await sendAgentic(text);
+  } else {
+    await sendNormal(text);
+  }
+}
+
+async function sendNormal(text) {
   try {
     const res = await api(`/sessions/${S.session}/chat`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ query: text, deep_search: S.deep, model: S.model, verbose: S.verbose }),
+      body: JSON.stringify({ query: text, deep_search: S.mode === 'deep', model: S.model, verbose: S.verbose }),
       signal: _abort.signal,
     });
     S.turns.push({
@@ -764,11 +807,165 @@ async function send() {
   }
 }
 
+async function sendAgentic(text) {
+  // --- start the SSE stream ---
+  let response;
+  try {
+    response = await fetch(`/api/sessions/${S.session}/chat-agentic`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ query: text, mode: 'agentic', model: S.model, verbose: S.verbose }),
+      signal: _abort.signal,
+    });
+  } catch (e) {
+    if (e.name === 'AbortError') {
+      S.turns.push({ id: Date.now(), role: 'assistant', content: '⏹ Stopped.', abstained: true, trace: [] });
+    } else {
+      S.turns.push({ id: Date.now(), role: 'assistant', content: `Connection failed: ${e.message}`, abstained: true, trace: [] });
+    }
+    S.busy = false; _abort = null;
+    toggleComposerButtons(false);
+    renderThread(); scrollThread(); loadSessions();
+    return;
+  }
+
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}));
+    S.turns.push({ id: Date.now(), role: 'assistant', content: `Request failed: ${err.detail || response.statusText}`, abstained: true, trace: [] });
+    S.busy = false; _abort = null;
+    toggleComposerButtons(false);
+    renderThread(); scrollThread(); loadSessions();
+    return;
+  }
+
+  // --- read the SSE stream ---
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  const liveTurnId = 'live-' + Date.now();
+  const liveSteps = [];
+
+  // Insert a placeholder bot turn that will be updated live.
+  S.turns.push({ id: liveTurnId, role: 'assistant', content: '', abstained: false, citations: [], scores: null, trace: [], reasoning_steps: liveSteps, live: true });
+  renderThread(); scrollThread();
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+
+      // SSE frames are separated by double newlines.
+      const parts = buffer.split('\n\n');
+      buffer = parts.pop() || '';  // last chunk may be incomplete
+
+      for (const part of parts) {
+        const lines = part.split('\n');
+        const dataLine = lines.find(l => l.startsWith('data: '));
+        if (!dataLine) continue;
+
+        let data;
+        try { data = JSON.parse(dataLine.slice(6)); }
+        catch (_) { continue; }
+
+        switch (data.type) {
+          case 'check':
+            // History relevance / contextualize — show as a thinking step.
+            liveSteps.push({ step: liveSteps.length + 1, tool: data.label || 'check', thought: data.summary || '', params: null, result: null, status: 'done' });
+            break;
+          case 'plan':
+            liveSteps.push({ step: data.step, tool: data.tool, thought: data.thought, params: data.params, result: null, status: 'pending' });
+            break;
+          case 'tool_result':
+            const match = liveSteps.find(s => s.step === data.step && s.tool === data.tool && s.status === 'pending');
+            if (match) { match.status = data.status === 'ok' ? 'done' : 'error'; match.summary = data.summary || data.error; match.detail = data.detail || ''; }
+            break;
+          case 'finalizing':
+            // Planner chose final answer — mark all remaining pending steps done.
+            liveSteps.forEach(s => { if (s.status === 'pending') s.status = 'done'; });
+            break;
+          case 'final':
+            // Replace the live placeholder with the finished turn.
+            const idx = S.turns.findIndex(t => t.id === liveTurnId);
+            if (idx !== -1) {
+              S.turns[idx] = {
+                id: Date.now(), role: 'assistant', content: data.answer,
+                abstained: data.abstained, citations: data.citations || [],
+                sub_questions: [], scores: data.scores,
+                trace: data.trace || [], reasoning_steps: data.reasoning_steps || liveSteps,
+              };
+            }
+            break;
+          case 'error':
+            const errMatch = liveSteps.find(s => s.step === data.step && s.tool);
+            if (errMatch) errMatch.status = 'error';
+            break;
+        }
+
+        // Re-render the live turn in-place after each event.
+        updateLiveTurn(liveTurnId, liveSteps);
+      }
+    }
+  } catch (e) {
+    if (e.name === 'AbortError') {
+      // Cancelled — the live turn stays with whatever steps were shown.
+    } else {
+      const idx = S.turns.findIndex(t => t.id === liveTurnId);
+      if (idx !== -1) S.turns[idx].content = `Stream error: ${e.message}`;
+    }
+  } finally {
+    S.busy = false; _abort = null;
+    toggleComposerButtons(false);
+    renderThread(); scrollThread(); loadSessions();
+  }
+}
+
+// --- live DOM patching during agentic streaming ---
+function updateLiveTurn(turnId, steps) {
+  const thread = document.getElementById('thread');
+  if (!thread) return;
+  const turnEl = thread.querySelector(`[data-turn-id="${turnId}"]`);
+  if (!turnEl) return;
+  const stepsEl = turnEl.querySelector('.agentic-steps');
+  if (!stepsEl) return;
+
+  stepsEl.innerHTML = steps.map(s => {
+    const cls = s.status === 'pending' ? 'step-pending step-live'
+              : s.status === 'error' ? 'step-error'
+              : 'step-done';
+    return `<div class="agentic-step ${cls}">
+      <div class="step-header">
+        <span class="step-num">Step ${s.step}</span>
+        <span class="step-tool">${esc(s.tool || '')}</span>
+        ${s.status === 'pending' ? '<span class="dots"><i></i><i></i><i></i></span>' : ''}
+      </div>
+      ${s.thought ? `<div class="step-thought">${esc(s.thought)}</div>` : ''}
+      ${s.params ? `<div class="step-params">${esc(typeof s.params === 'string' ? s.params : JSON.stringify(s.params))}</div>` : ''}
+      ${s.summary ? `<div class="step-result">${esc(s.summary)}</div>` : ''}
+      ${s.detail ? `<div class="step-result" style="color:var(--muted);font-size:11px">${esc(s.detail)}</div>` : ''}
+    </div>`;
+  }).join('');
+
+  // Auto-scroll to latest step.
+  stepsEl.scrollTop = stepsEl.scrollHeight;
+  scrollThread();
+}
+
 function toggleComposerButtons(busy) {
   const send = document.getElementById('send');
   const stop = document.getElementById('stop');
   if (send) send.style.display = busy ? 'none' : '';
   if (stop) stop.style.display = busy ? '' : 'none';
+}
+
+function updateHint() {
+  const hint = document.querySelector('.hint');
+  if (!hint) return;
+  const hints = {
+    normal: 'ANSWERS ARE GROUNDED IN THIS REPORT ONLY · ENTER TO SEND',
+    deep: 'DEEP SEARCH — DECOMPOSES + JUDGES · ENTER TO SEND',
+    agentic: 'AGENTIC — PLANNER RESEARCHES STEP BY STEP · ENTER TO SEND',
+  };
+  hint.textContent = hints[S.mode] || hints.normal;
 }
 
 function stopChat() {
@@ -818,12 +1015,17 @@ document.getElementById('ocr-hdr').onclick = e => {
   b.style.background = S.ocr ? '' : '';
   b.querySelector('.switch').style.background = S.ocr ? '' : '';
 };
-document.getElementById('deep').onclick = e => {
-  S.deep = !S.deep;
-  const b = e.currentTarget;
-  b.dataset.on = S.deep ? '1' : '0';
-  b.setAttribute('aria-pressed', String(S.deep));
-};
+// Mode selector — mutually exclusive Normal / Deep / Agentic.
+document.querySelectorAll('.mode-btn').forEach(b => {
+  b.onclick = () => {
+    S.mode = b.dataset.mode;
+    document.querySelectorAll('.mode-btn').forEach(bb => {
+      bb.setAttribute('aria-pressed', String(bb.dataset.mode === S.mode));
+    });
+    // Update the hint text under the composer.
+    updateHint();
+  };
+});
 
 document.getElementById('verbose').onclick = e => {
   S.verbose = !S.verbose;

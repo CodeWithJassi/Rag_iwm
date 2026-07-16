@@ -91,6 +91,20 @@ MIGRATIONS = [
     "CREATE INDEX IF NOT EXISTS chunks_fts_idx ON chunks USING gin (fts)",
     # JSONB metadata — tags, enrichment data, image paths, and future extensions.
     "ALTER TABLE chunks ADD COLUMN IF NOT EXISTS metadata JSONB",
+    # Agentic RAG reasoning traces.  One row per planner step, linked to the
+    # turn that produced it.  CASCADE delete so removing a chat cleans up.
+    """CREATE TABLE IF NOT EXISTS reasoning_traces (
+        id          BIGSERIAL PRIMARY KEY,
+        turn_id     BIGINT NOT NULL REFERENCES turns(id) ON DELETE CASCADE,
+        step        INT NOT NULL,
+        tool        TEXT,
+        input_data  JSONB,
+        output_data JSONB,
+        plan_text   TEXT,
+        reflection  TEXT,
+        created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+    )""",
+    "CREATE INDEX IF NOT EXISTS traces_turn_idx ON reasoning_traces (turn_id, step)",
 ]
 
 # Post-SCHEMA migrations that need procedural logic (conditionals, loops).

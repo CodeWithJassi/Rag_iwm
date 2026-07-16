@@ -43,7 +43,10 @@
       "Bash(sed '1d;$d')",
       "Bash(node --check /tmp/check_syntax.js)",
       "Bash(node --check /tmp/check_js.js)",
-      "Bash(grep -n \"def table_chunks\\\\|logger.info.*table chunks\\\\|return out$\" /mnt/e/for_ubuntu/claude_dev/rag_project_iwm/backend/chunking.py)"
+      "Bash(grep -n \"def table_chunks\\\\|logger.info.*table chunks\\\\|return out$\" /mnt/e/for_ubuntu/claude_dev/rag_project_iwm/backend/chunking.py)",
+      "Bash(../venv/bin/python3 -m py_compile agentic.py)",
+      "Bash(../venv/bin/python3 -m py_compile main.py)",
+      "Bash(../venv/bin/python3 -m py_compile tools.py)"
     ]
   }
 }
